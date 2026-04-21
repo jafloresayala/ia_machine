@@ -14,6 +14,30 @@ from analytics import numeric_summary
 from chart_ai import chart_with_ai
 
 
+_TYPE_EMOJI = {
+    "float":    "🟢",
+    "int":      "🔵",
+    "bool":     "🟡",
+    "string":   "🟠",
+    "datetime": "🟣",
+    "unknown":  "⚫",
+}
+
+def _normalize_type(raw) -> str:
+    r = str(raw or "").lower().strip()
+    if any(x in r for x in ("double", "float", "single", "real", "number")):
+        return "float"
+    if any(x in r for x in ("int", "integer", "long", "int32", "int64")):
+        return "int"
+    if any(x in r for x in ("bool", "boolean", "digital")):
+        return "bool"
+    if any(x in r for x in ("string", "text", "str")):
+        return "string"
+    if any(x in r for x in ("time", "date", "timestamp")):
+        return "datetime"
+    return "unknown"
+
+
 def render():
     page_header(
         eyebrow="Intelligence · Compare",
@@ -54,18 +78,30 @@ def render():
     rows_selected = [df.iloc[all_names.index(s)] for s in selected]
 
     # ---- Paso 1: cargar TODOS los tags de cada máquina (sin límite) para el dropdown ----
-    machine_tags = {}   # machine_name -> {short_name: full_piPoint}
+    machine_tags  = {}   # machine_name -> {short_name: full_piPoint}
+    machine_types = {}   # machine_name -> {short_name: normalized_type}
     for row in rows_selected:
         tags_df = get_machine_tags(row["machine_path"])
         if tags_df.empty:
-            machine_tags[row["machine_name"]] = {}
+            machine_tags[row["machine_name"]]  = {}
+            machine_types[row["machine_name"]] = {}
             continue
         mapping = {}
+        types   = {}
         for _, tr in tags_df.iterrows():
-            full = str(tr["piPoint"])
+            full  = str(tr["piPoint"])
             short = full.split(".")[-1] if "." in full else full
             mapping[short] = full
-        machine_tags[row["machine_name"]] = mapping
+            types[short]   = _normalize_type(tr.get("type", ""))
+        machine_tags[row["machine_name"]]  = mapping
+        machine_types[row["machine_name"]] = types
+
+    # Tipo representativo por short name (primera máquina que lo tenga)
+    common_type_map: dict[str, str] = {}
+    for types in machine_types.values():
+        for short, typ in types.items():
+            if short not in common_type_map:
+                common_type_map[short] = typ
 
     # ---- Parámetros comunes (presentes en ≥2 máquinas) ----
     all_shorts = [set(m.keys()) for m in machine_tags.values()]
@@ -84,9 +120,21 @@ def render():
         st.info("No se encontraron parámetros con el mismo nombre entre las máquinas seleccionadas.")
         return
 
+    def fmt_param(short: str) -> str:
+        typ   = common_type_map.get(short, "unknown")
+        emoji = _TYPE_EMOJI.get(typ, "⚫")
+        return f"{emoji} {short}  [{typ}]"
+
+    st.caption(
+        "Tipos: "
+        + "  ".join(f"{e} {k}" for k, e in _TYPE_EMOJI.items() if k != "unknown")
+        + "  ⚫ desconocido"
+    )
+
     sel_param = st.selectbox(
         f"Parámetro común a comparar ({len(common_sorted)} disponibles)",
         options=common_sorted,
+        format_func=fmt_param,
     )
 
     # ---- Paso 2: cargar datos solo del parámetro seleccionado ----

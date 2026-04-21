@@ -17,19 +17,50 @@ from chart_ai import chart_with_ai
 
 
 # ----------------------------------------------------------------
+# Tipos de parametro: normalizacion y colores (emoji)
+# ----------------------------------------------------------------
+_TYPE_EMOJI = {
+    "float":    "🟢",
+    "int":      "🔵",
+    "bool":     "🟡",
+    "string":   "🟠",
+    "datetime": "🟣",
+    "unknown":  "⚫",
+}
+
+def _normalize_type(raw) -> str:
+    """Mapea el tipo PI a una categoria normalizada."""
+    r = str(raw or "").lower().strip()
+    if any(x in r for x in ("double", "float", "single", "real", "number")):
+        return "float"
+    if any(x in r for x in ("int", "integer", "long", "int32", "int64")):
+        return "int"
+    if any(x in r for x in ("bool", "boolean", "digital")):
+        return "bool"
+    if any(x in r for x in ("string", "text", "str")):
+        return "string"
+    if any(x in r for x in ("time", "date", "timestamp")):
+        return "datetime"
+    return "unknown"
+
+
+# ----------------------------------------------------------------
 # Helper: obtener todos los tags de una maquina (sin limite, sin datos)
 # ----------------------------------------------------------------
 def _get_all_tags(machine_path: str):
-    """Devuelve lista de piPoint completos y un dict short->full."""
+    """Devuelve lista de piPoint completos, dict short_map y dict type_map."""
     tags_df = get_machine_tags(machine_path)
     if tags_df.empty:
-        return [], {}
+        return [], {}, {}
     full_names = tags_df["piPoint"].astype(str).tolist()
     short_map = {}   # full_tag -> short_name
-    for full in full_names:
+    type_map  = {}   # full_tag -> normalized_type
+    for _, row in tags_df.iterrows():
+        full = str(row["piPoint"])
         short = full.split(".")[-1] if "." in full else full
         short_map[full] = short
-    return full_names, short_map
+        type_map[full]  = _normalize_type(row.get("type", ""))
+    return full_names, short_map, type_map
 
 
 # ----------------------------------------------------------------
@@ -90,7 +121,7 @@ def render():
     st.session_state.analytics_machine = row["machine_name"]
 
     # -- Cargar metadata de TODOS los tags (solo nombres, sin datos) --
-    all_tags, short_map = _get_all_tags(row["machine_path"])
+    all_tags, short_map, type_map = _get_all_tags(row["machine_path"])
     if not all_tags:
         st.info("Esta maquina no tiene tags configurados.")
         return
@@ -98,7 +129,17 @@ def render():
     from_dt, to_dt = resolve_time_range(window)
 
     def fmt_tag(t):
-        return short_map.get(t, t)
+        short = short_map.get(t, t)
+        typ   = type_map.get(t, "unknown")
+        emoji = _TYPE_EMOJI.get(typ, "⚫")
+        return f"{emoji} {short}  [{typ}]"
+
+    # Leyenda de tipos
+    st.caption(
+        "Tipos: "
+        + "  ".join(f"{e} {k}" for k, e in _TYPE_EMOJI.items() if k != "unknown")
+        + "  ⚫ desconocido"
+    )
 
     # ============================================================
     t1, t2, t3, t4 = st.tabs(["Outliers", "Correlacion", "Distribuciones", "Anomalias"])
@@ -225,7 +266,7 @@ def render():
                             ),
                         )
                     )
-                    chart_with_ai(heat + text_layer, df=None, chart_id="analytics_corr_heatmap",
+                    chart_with_ai(heat + text_layer, df=corr_long, chart_id="analytics_corr_heatmap",
                                   context={"type": "correlation_heatmap", "n_params": len(corr.columns)})
 
                     # Top pares correlacionados
