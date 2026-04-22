@@ -17,7 +17,17 @@ import pandas as pd
 import altair as alt
 import streamlit as st
 
-from llm_engine import chat_completion_json, chat_completion
+from llm_engine import chat_completion_json, chat_completion, _extract_json
+
+# Optional: statsmodels para ARIMA/SARIMA (pip install statsmodels)
+try:
+    from statsmodels.tsa.stattools import acf as _sm_acf, pacf as _sm_pacf
+    from statsmodels.tsa.ar_model import AutoReg as _AutoReg
+    from statsmodels.tsa.arima.model import ARIMA as _ARIMA
+    from statsmodels.tsa.statespace.sarimax import SARIMAX as _SARIMAX
+    _HAS_STATSMODELS = True
+except ImportError:
+    _HAS_STATSMODELS = False
 
 
 # ==================================================================
@@ -79,6 +89,28 @@ Cuando el usuario pida predecir, pronosticar o modelar valores futuros:
 - NUNCA pongas formulas como "mean + 2*std" — haz la aritmetica tu mismo.
 - Puedes combinar multiples overlays en el array.
 - Si la peticion no es clara, haz lo mas util posible y explica en 'explanation'.
+
+== MODIFICAR OVERLAYS EXISTENTES (PRIORIDAD ALTA) ==
+CUANDO el mensaje del usuario haga referencia a algo que ya esta en la grafica
+(ej: "la linea AR", "el modelo MA", "la media movil", "esa serie", "ese overlay", "cambia el color",
+"hazla punteada", "ponla mas gruesa", "cambia a rojo", "quiero verde", etc.)
+DEBES usar "action": "replace_by_label" en lugar de crear un overlay nuevo.
+
+Regla: busca en la lista "existing_overlays" del contexto el overlay cuyo label se parezca mas
+al que menciona el usuario (coincidencia parcial, sin importar mayusculas/minusculas).
+Solo devuelve los campos que CAMBIAN — Python hace el merge con los datos existentes.
+NO re-calcules ni incluyas "data" al modificar una serie existente.
+
+Ejemplos de peticion → respuesta correcta:
+  "cambia el color de AR a verde"    → {"type":"series",  "action":"replace_by_label", "label":"AR(5)",    "color":"#10b981"}
+  "ponla roja"                       → {"type":"series",  "action":"replace_by_label", "label":"<label del ultimo overlay>", "color":"#ef4444"}
+  "la tendencia mas gruesa"          → {"type":"trendline","action":"replace_by_label", "label":"Tendencia","width":3}
+  "media movil punteada"             → {"type":"moving_avg","action":"replace_by_label","label":"Media movil","dashed":true}
+  "quita el fondo gris"              → {"type":"band",     "action":"replace_by_label", "label":"<label de la banda>", "opacity":0.05}
+  "hazla discontinua"                → {"type":"series",  "action":"replace_by_label", "label":"<label>",  "dashed":true}
+
+Si el usuario no especifica cual overlay, usa el ultimo de la lista "existing_overlays".
+Si no hay overlays existentes y el usuario pide modificar, CREA uno nuevo apropiado.
 """
 
 _QA_SYSTEM = """Eres un analista de datos industriales SMT experto en estadistica y control de procesos.
@@ -119,6 +151,404 @@ PARAMETROS:
 
 Analiza 'sample_values' para detectar si los datos suben/bajan/oscilan/tienen curvatura.
 """
+
+
+_CODE_SYSTEM = """Eres un cientifico de datos senior experto en Python, estadistica, ML, series de tiempo y visualizacion.
+Tu tarea: leer el codigo/spec de la grafica, los datos y la peticion del usuario, y devolver Python que genere
+overlays y/o sub-graficas para modificar la grafica segun lo pedido.
+
+RESPONDE SIEMPRE CON JSON VALIDO EN ESTE ESQUEMA EXACTO:
+{
+  "mode": "code" | "overlay",
+  "python_code": "<codigo Python completo, SOLO cuando mode=code>",
+  "overlays": [ ... ],              // usado solo cuando mode=overlay (cambios simples)
+  "explanation": "descripcion breve, 1-3 frases"
+}
+
+== CUANDO USAR mode="overlay" ==
+Cambios simples y declarativos (color, grosor, dashed, threshold, banda, media movil, EWM, trendline).
+Mismos tipos que el sistema OVERLAY (hline/band/vline/series/series_band/trendline/moving_avg/ewm/forecast).
+Para modificar un overlay existente: incluye "action":"replace_by_label", "label":"<label>" y los campos a cambiar.
+
+== CUANDO USAR mode="code" ==
+Cualquier operacion que requiera calculo custom: Isolation Forest, DBSCAN, K-means, PCA, detección de
+anomalías avanzada, algoritmos que no esten en la lista de overlays, transformaciones complejas,
+ventanas rodantes customizadas, tests estadisticos, etc.
+
+== CONTRATO DEL CODIGO Python ==
+El codigo se ejecuta en un sandbox con estas variables/modulos pre-cargados:
+  df            : pandas.DataFrame (datos de la grafica; columnas tipicas: TimeStamp, Value_Num)
+  pd, np, alt   : pandas, numpy, altair
+  datetime      : modulo datetime de stdlib
+  math          : modulo math de stdlib
+  sklearn       : scikit-learn (puede ser None si no instalado \u2014 verifica antes de usar)
+  statsmodels   : modulo statsmodels (puede ser None)
+  scipy         : scipy (puede ser None)
+  chart_spec    : dict con la spec Vega-Lite actual de la grafica (informativo)
+  result        : dict que DEBES poblar con las claves: "overlays", "sub_charts", "explanation"
+
+REGLAS DEL CODIGO:
+1. PUEDES usar "from sklearn.X import Y", "from scipy.X import Y", "from statsmodels.X import Y" — estan permitidos y necesarios.
+   Las clases mas comunes ya estan pre-cargadas en el namespace (IsolationForest, KMeans, StandardScaler, PCA, LinearRegression), pero si necesitas otra haz el import.
+2. NO uses open(), exec(), eval(), input(), os, sys, subprocess, requests \u2014 prohibido.
+3. Para usar sklearn: if sklearn is not None: from sklearn.ensemble import IsolationForest. Si sklearn es None, cae a un metodo alternativo (ej: z-score).
+4. Poblar result["overlays"] con dicts del mismo esquema que los overlays JSON.
+5. Poblar result["sub_charts"] con dicts {"title":"...", "type":"altair", "chart": <alt.Chart>} o {"type":"table","df":<pd.DataFrame>} o {"type":"markdown","content":"..."}.
+6. result["explanation"] \u2014 string en espanol breve.
+7. Manejar casos borde: df vacio, columnas faltantes \u2014 con if/return early populando explanation.
+8. Para anomalias: marcar los puntos anomalos como un overlay "series" con data=[{"t":ts,"y":val}] y color rojo/naranja, O como puntos sueltos en un sub_chart.
+
+EJEMPLO (Isolation Forest para detectar anomalias — incluye puntos rojos + tabla):
+```
+if "Value_Num" not in df.columns or len(df) < 10:
+    result["explanation"] = "No hay suficientes datos para detectar anomalias."
+else:
+    d = df.dropna(subset=["Value_Num","TimeStamp"]).copy()
+    d["TimeStamp"] = pd.to_datetime(d["TimeStamp"], errors="coerce")
+    if sklearn is not None:
+        from sklearn.ensemble import IsolationForest
+        iso = IsolationForest(contamination=0.05, random_state=42)
+        d["_anom"] = iso.fit_predict(d[["Value_Num"]])
+        anom = d[d["_anom"] == -1].sort_values("TimeStamp")
+        method = "Isolation Forest"
+    else:
+        z = (d["Value_Num"] - d["Value_Num"].mean()) / d["Value_Num"].std()
+        anom = d[z.abs() > 2.5].sort_values("TimeStamp")
+        method = "z-score (|z|>2.5, sklearn no disponible)"
+    if not anom.empty:
+        # (1) Marcar anomalias como PUNTOS ROJOS discretos sobre la grafica
+        result["overlays"].append({
+            "type": "points",   # <-- "points" = marcadores discretos (NO linea)
+            "data": [{"t": row["TimeStamp"].isoformat(), "y": float(row["Value_Num"])} for _, row in anom.iterrows()],
+            "label": f"Anomalias ({len(anom)})",
+            "color": "#ef4444",
+            "size":  90,
+        })
+        # (2) Tabla con los valores anomalos
+        anom_table = anom[["TimeStamp", "Value_Num"]].copy()
+        anom_table.columns = ["Tiempo", "Valor"]
+        result["sub_charts"].append({
+            "title": f"Tabla de anomalias ({len(anom)} puntos)",
+            "type": "table",
+            "df": anom_table,
+        })
+    result["explanation"] = f"Detectadas {len(anom)} anomalias con {method}. Puntos marcados en rojo + tabla debajo."
+```
+
+TIPOS DE OVERLAY:
+- "points" / "scatter": marcadores discretos (anomalias, outliers, highlights). Ideal para anomaly detection.
+- "series": linea conectada (para suavizados, predicciones, medias moviles).
+- "hline", "vline", "band", "trendline", "moving_avg", "ewm", "forecast", "series_band".
+
+BUENAS PRACTICAS PROFESIONALES:
+- Si detectas anomalias/outliers: usa type="points" en rojo/naranja + tabla en sub_charts con los valores.
+- Si haces clustering: colorea puntos por cluster y agrega sub_chart con metricas (silhouette, inertia).
+- Si haces descomposicion (STL): agrega sub_charts separados para tendencia/estacional/residual.
+- Si haces SPC: agrega hlines para UCL/LCL + tabla de puntos fuera de control.
+- Si calculas capability (Cp/Cpk): usa sub_chart tipo markdown con los indices formateados.
+- SIEMPRE que tengas datos numericos relevantes, devuelve tambien una tabla (sub_chart type="table").
+
+TRAMPAS COMUNES DE CODIGO — EVITALAS:
+- sklearn NO acepta datetime directamente. Convierte TimeStamp a numerico primero:
+    x_num = (d["TimeStamp"].astype("int64") // 10**9).values.reshape(-1, 1)  # segundos Unix
+  Luego usa x_num en .fit() y .predict().
+- Para predecir fechas futuras:
+    future_dates = pd.date_range(start=d["TimeStamp"].max(), periods=N, freq=...)
+    future_num   = (future_dates.astype("int64") // 10**9).values.reshape(-1, 1)
+    future_vals  = model.predict(future_num)
+  Luego zip(future_dates, future_vals) para construir los puntos de overlay.
+- NUNCA llames .reshape() a DatetimeIndex ni a objetos pd.Timestamp — NO tiene ese metodo.
+- Para forecasting lineal simple preferible usa holt o statsmodels.tsa (mejores para series industriales).
+
+
+== MODIFICAR OVERLAYS EXISTENTES (contexto clave) ==
+Recibiras "existing_overlays" con lista de overlays ya visibles (cada uno con su label).
+Si el usuario pide cambiar color/estilo/grosor de algo ya visible \u2014 usa mode="overlay" con action="replace_by_label".
+Si el usuario no especifica cual, usa el ultimo de existing_overlays.
+
+Devuelve SOLO el JSON final, sin markdown ni texto adicional.
+"""
+
+
+_CODE_FREE_SYSTEM = """Eres un cientifico de datos e ingeniero Python senior con libertad CREATIVA TOTAL.
+El usuario invoco el comando @code, esto significa que quiere que uses tu inteligencia general y
+tu capacidad generativa para hacer LO QUE PIDA, sin limitarte a overlays predefinidos.
+
+RESPONDE SIEMPRE CON JSON VALIDO EN ESTE ESQUEMA:
+{
+  "python_code": "<codigo Python completo que implementa lo que pide el usuario>",
+  "explanation": "descripcion breve en espanol de lo que hace el codigo"
+}
+
+== LIBERTAD TOTAL ==
+- Puedes usar CUALQUIER tecnica: ML (sklearn), estadistica (statsmodels, scipy), deep learning,
+  procesamiento de senales, deteccion de anomalias, clustering, PCA, UMAP, transformaciones Fourier,
+  wavelets, descomposicion de series, SPC, capability indices (Cp/Cpk), pruebas de hipotesis,
+  bootstrap, simulaciones Monte Carlo, modelos bayesianos, lo que sea apropiado.
+- Puedes crear graficas nuevas completas en sub_charts (histogramas, scatter, heatmaps, boxplots,
+  violin, QQ plots, diagramas de control, cartas X-R, cualquier tipo).
+- Puedes transformar el df como quieras antes de analizar.
+- Si el usuario pide algo creativo, IMPLEMENTALO, no digas que no es posible.
+
+== CONTRATO DEL CODIGO Python ==
+Variables disponibles en el namespace:
+  df            : pandas.DataFrame con los datos (columnas tipicas: TimeStamp, Value_Num)
+  pd, np, alt   : pandas, numpy, altair
+  math, datetime: modulos stdlib
+  sklearn       : scikit-learn (puede ser None; verifica)
+  statsmodels   : statsmodels (puede ser None; verifica)
+  scipy         : scipy (puede ser None; verifica)
+  chart_spec    : dict con la spec Vega-Lite actual de la grafica
+  result        : dict que DEBES poblar con "overlays", "sub_charts", "explanation"
+
+Puedes hacer 'from sklearn.X import Y', imports ampliamente permitidos salvo OS/red/archivos.
+
+POBLAR result:
+  result["overlays"]    = [<dicts overlay>]     # superponer a la grafica principal
+  result["sub_charts"]  = [<dicts sub-chart>]   # graficas nuevas debajo
+  result["explanation"] = "<string espanol>"
+
+Tipos de overlay validos: hline, band, vline, series, series_band, trendline, moving_avg, ewm, forecast.
+Para modificar uno existente: {"type":"...", "action":"replace_by_label", "label":"X", <campos>}.
+
+Tipos de sub_chart:
+  {"title": "...", "type": "altair",   "chart":   <alt.Chart>}
+  {"title": "...", "type": "table",    "df":      <pd.DataFrame>}
+  {"title": "...", "type": "markdown", "content": "..."}
+
+== REGLAS ==
+1. Maneja df vacio o columnas faltantes con explicacion clara.
+2. NO uses open/exec/eval/input/os/sys/requests/subprocess (bloqueados por sandbox).
+3. Si sklearn/statsmodels/scipy es None, usa alternativa con numpy/pandas.
+4. PIENSA EN GRANDE: si el usuario pide analisis profundo, da overlays + sub_charts + markdown.
+
+Devuelve SOLO el JSON final.
+"""
+
+
+# ==================================================================
+# Sandbox de ejecucion de codigo generado por la IA
+# ==================================================================
+_SAFE_BUILTINS = {
+    "abs": abs, "all": all, "any": any, "bool": bool, "bytes": bytes,
+    "callable": callable, "chr": chr, "complex": complex, "dict": dict,
+    "divmod": divmod, "enumerate": enumerate, "filter": filter, "float": float,
+    "format": format, "frozenset": frozenset, "getattr": getattr, "hasattr": hasattr,
+    "hash": hash, "hex": hex, "int": int, "isinstance": isinstance, "issubclass": issubclass,
+    "iter": iter, "len": len, "list": list, "map": map, "max": max, "min": min,
+    "next": next, "object": object, "oct": oct, "ord": ord, "pow": pow, "print": print,
+    "range": range, "repr": repr, "reversed": reversed, "round": round, "set": set,
+    "slice": slice, "sorted": sorted, "str": str, "sum": sum, "tuple": tuple,
+    "type": type, "zip": zip, "True": True, "False": False, "None": None,
+    # Permitir que sklearn/statsmodels use from X import Y: necesitamos __import__ pero filtrado
+}
+
+
+def _safe_import(name, *args, **kwargs):
+    """Permite imports con libertad amplia, bloqueando solo OS/red/procesos/archivos."""
+    BLOCKED = {
+        "os", "sys", "subprocess", "socket", "shutil", "pathlib",
+        "requests", "urllib", "urllib3", "http", "httplib", "httpx",
+        "ftplib", "smtplib", "telnetlib", "ssl",
+        "ctypes", "cffi", "multiprocessing", "threading", "asyncio",
+        "builtins", "importlib", "pickle", "marshal", "shelve",
+        "tempfile", "glob", "fileinput", "io", "codecs",
+        "webbrowser", "platform", "getpass", "pwd", "grp",
+    }
+    base = name.split(".")[0]
+    if base in BLOCKED:
+        raise ImportError(f"Import bloqueado por seguridad (OS/red/archivos): {name}")
+    return __import__(name, *args, **kwargs)
+
+
+def _execute_llm_code(code: str, df, chart_spec: dict | None = None) -> dict:
+    """Ejecuta codigo Python generado por la IA en un sandbox restringido.
+    Retorna {"overlays":[], "sub_charts":[], "explanation":"", "error":str|None, "stdout":str}.
+    """
+    import io, contextlib, math as _math, datetime as _datetime
+    # Lazy imports opcionales
+    try:
+        import sklearn as _sklearn
+    except Exception:
+        _sklearn = None
+    try:
+        import statsmodels as _statsmodels
+    except Exception:
+        _statsmodels = None
+    try:
+        import scipy as _scipy
+    except Exception:
+        _scipy = None
+
+    result: dict = {"overlays": [], "sub_charts": [], "explanation": ""}
+
+    safe_builtins = dict(_SAFE_BUILTINS)
+    safe_builtins["__import__"] = _safe_import
+
+    # Pre-cargar clases sklearn comunes para que el modelo pueda usarlas directamente
+    _preloaded = {}
+    if _sklearn is not None:
+        try:
+            from sklearn.ensemble import IsolationForest as _IF, RandomForestRegressor as _RFR
+            from sklearn.cluster import KMeans as _KM, DBSCAN as _DBSCAN
+            from sklearn.decomposition import PCA as _PCA
+            from sklearn.preprocessing import StandardScaler as _SS
+            from sklearn.linear_model import LinearRegression as _LR
+            _preloaded = {
+                "IsolationForest": _IF, "KMeans": _KM, "DBSCAN": _DBSCAN,
+                "PCA": _PCA, "StandardScaler": _SS, "LinearRegression": _LR,
+                "RandomForestRegressor": _RFR,
+            }
+        except Exception:
+            pass
+
+    namespace: dict = {
+        "__builtins__": safe_builtins,
+        "pd": pd, "np": np, "alt": alt,
+        "math": _math, "datetime": _datetime,
+        "sklearn": _sklearn, "statsmodels": _statsmodels, "scipy": _scipy,
+        "df": df.copy() if df is not None else None,
+        "chart_spec": chart_spec or {},
+        "result": result,
+        **_preloaded,
+    }
+
+    buf = io.StringIO()
+    error_msg: str | None = None
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            exec(code, namespace)
+        # Recuperar result mutado (puede haber sido reasignado)
+        new_result = namespace.get("result", result)
+        if isinstance(new_result, dict):
+            result = new_result
+    except Exception as e:
+        import traceback
+        error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
+
+    # Normalizar claves
+    result.setdefault("overlays", [])
+    result.setdefault("sub_charts", [])
+    result.setdefault("explanation", "")
+    result["error"]  = error_msg
+    result["stdout"] = buf.getvalue()
+    return result
+
+
+# ==================================================================
+# Comandos analiticos disponibles (para @ autocomplete)
+# ==================================================================
+_ANALYSIS_COMMANDS: dict[str, dict] = {
+    # ------- Estadístico -------
+    "@acf": {
+        "label": "📊 ACF",
+        "desc": "Funcion de Autocorrelacion — correlacion entre la serie y versiones desfasadas",
+        "category": "Estadístico",
+        "template": "@acf",
+        "keywords": ["acf", "autocorrelac", "correlacion lag"],
+    },
+    "@pacf": {
+        "label": "📊 PACF",
+        "desc": "Autocorrelacion Parcial — identifica el orden p para modelo AR",
+        "category": "Estadístico",
+        "template": "@pacf",
+        "keywords": ["pacf", "autocorrelacion parcial", "parcial autocorr"],
+    },
+    # ------- Modelos predictivos -------
+    "@ar": {
+        "label": "🔢 AR",
+        "desc": "Modelo Autorregresivo AR(p) — predice basado en valores anteriores",
+        "category": "Modelo",
+        "template": "@ar predice 1 dia adelante",
+        "keywords": ["autorregres", "ar(", "modelo ar"],
+    },
+    "@ma": {
+        "label": "〰️ MA",
+        "desc": "Promedio Movil MA(q) — modelo basado en errores pasados",
+        "category": "Modelo",
+        "template": "Ajusta modelo de Promedio Movil MA y predice el comportamiento",
+        "keywords": ["ma(", "modelo ma ", "moving average modelo"],
+    },
+    "@arima": {
+        "label": "📈 ARIMA",
+        "desc": "ARIMA(p,d,q) — integra diferenciacion para series no estacionarias",
+        "category": "Modelo",
+        "template": "@arima predice 3 dias adelante",
+        "keywords": ["arima"],
+    },
+    "@sarima": {
+        "label": "🌊 SARIMA",
+        "desc": "SARIMA estacional — captura ciclos de turnos o produccion",
+        "category": "Modelo",
+        "template": "@sarima predice 1 semana adelante",
+        "keywords": ["sarima", "sarimax", "estacional arima"],
+    },
+    "@nonlinear": {
+        "label": "🔀 No Lineal",
+        "desc": "Modelo de regimen dual TAR — detecta dos estados de operacion",
+        "category": "Modelo",
+        "template": "@nonlinear predice con modelo TAR",
+        "keywords": ["no lineal", "nonlinear", "tar ", "regimen dual"],
+    },
+    "@holt": {
+        "label": "📉 Holt",
+        "desc": "Suavizado exponencial doble — nivel + tendencia",
+        "category": "Modelo",
+        "template": "@holt predice 3 dias adelante",
+        "keywords": [],
+    },
+    "@seasonal": {
+        "label": "🔄 Estacional FFT",
+        "desc": "Prediccion estacional por FFT — detecta ciclos dominantes",
+        "category": "Modelo",
+        "template": "@seasonal predice 1 semana adelante",
+        "keywords": [],
+    },
+    # ------- Validación -------
+    "@compare": {
+        "label": "🏆 Comparar Modelos",
+        "desc": "Ajusta varios modelos y compara RMSE / MAE en datos de prueba",
+        "category": "Validación",
+        "template": "@compare",
+        "keywords": ["comparar modelos", "comparacion modelos", "rmse", "mae", "mejor modelo"],
+    },
+    "@residuals": {
+        "label": "🔍 Residuos",
+        "desc": "Analiza residuos del modelo — independencia y homocedasticidad",
+        "category": "Validación",
+        "template": "@residuals",
+        "keywords": ["residuos", "residual", "homocedasticidad", "independencia residuos"],
+    },
+    # ------- Visual -------
+    "@sigma": {
+        "label": "📐 Sigma",
+        "desc": "Bandas de control ±2σ o ±3σ",
+        "category": "Visual",
+        "template": "Dibuja limites de control a 2 sigma",
+        "keywords": [],
+    },
+    "@movavg": {
+        "label": "〰️ Media Movil",
+        "desc": "Promedio movil de N puntos",
+        "category": "Visual",
+        "template": "Agrega media movil de 20 puntos",
+        "keywords": [],
+    },
+    "@ewm": {
+        "label": "📊 EWM",
+        "desc": "Suavizado exponencial ponderado",
+        "category": "Visual",
+        "template": "Suaviza la senal con EWM alpha 0.3",
+        "keywords": [],
+    },
+    "@code": {
+        "label": "🧠 Code (IA libre)",
+        "desc": "Da libertad total a la IA: genera Python para cualquier analisis/modelo/visualizacion",
+        "category": "🧠 IA Libre",
+        "template": "@code ",
+        "keywords": [],
+    },
+}
 
 
 # ==================================================================
@@ -494,20 +924,36 @@ def _apply_overlays(base_chart: alt.Chart, overlays: list[dict], df: pd.DataFram
                     ).encode(x="x:T", text=alt.value(label))
                     layers.append(txt)
 
-            elif ov_type == "series" and "data" in ov:
+            elif ov_type in ("series", "points", "scatter") and "data" in ov:
                 # Serie calculada por el LLM: [{"t": ISO_str, "y": float}, ...]
+                # type="series"  -> linea continua (min 2 puntos)
+                # type="points"  -> marcadores discretos (anomalias, outliers); cualquier cantidad >= 1
+                # type="scatter" -> alias de points
                 raw_data = ov["data"]
-                if isinstance(raw_data, list) and len(raw_data) >= 2:
+                as_points = ov_type in ("points", "scatter") or ov.get("mark") in ("point", "circle", "dot")
+                min_pts = 1 if as_points else 2
+                if isinstance(raw_data, list) and len(raw_data) >= min_pts:
                     series_df = pd.DataFrame(raw_data)
                     series_df["t"] = pd.to_datetime(series_df["t"], errors="coerce")
                     series_df["y"] = pd.to_numeric(series_df["y"], errors="coerce")
                     series_df = series_df.dropna()
                     if not series_df.empty:
                         stroke_w = float(ov.get("width", 2))
-                        s_line = alt.Chart(series_df).mark_line(
-                            color=color, strokeDash=stroke_dash, strokeWidth=stroke_w, opacity=0.9
-                        ).encode(x="t:T", y="y:Q")
-                        layers.append(s_line)
+                        if as_points:
+                            size = float(ov.get("size", 80))
+                            s_layer = alt.Chart(series_df).mark_point(
+                                color=color, filled=True, size=size,
+                                opacity=float(ov.get("opacity", 0.9)),
+                            ).encode(
+                                x="t:T", y="y:Q",
+                                tooltip=[alt.Tooltip("t:T", title="Tiempo"),
+                                         alt.Tooltip("y:Q", title="Valor", format=".4f")],
+                            )
+                        else:
+                            s_layer = alt.Chart(series_df).mark_line(
+                                color=color, strokeDash=stroke_dash, strokeWidth=stroke_w, opacity=0.9
+                            ).encode(x="t:T", y="y:Q")
+                        layers.append(s_layer)
                         if label:
                             last = series_df.iloc[-1]
                             txt_df = pd.DataFrame({"x": [last["t"]], "y": [last["y"]]})
@@ -842,6 +1288,724 @@ def _llm_guided_forecast(
 
 
 # ==================================================================
+# Analisis estadisticos avanzados (ACF, PACF, AR, MA, ARIMA …)
+# ==================================================================
+
+def _prep_ts_data(df) -> dict | None:
+    """Extrae y limpia la serie de tiempo del DataFrame. Retorna dict con arrays clave o None."""
+    if df is None or df.empty:
+        return None
+    if "Value_Num" not in df.columns or "TimeStamp" not in df.columns:
+        return None
+    d = df.dropna(subset=["Value_Num", "TimeStamp"]).copy()
+    d["TimeStamp"] = pd.to_datetime(d["TimeStamp"], errors="coerce")
+    d = d.dropna(subset=["TimeStamp"]).sort_values("TimeStamp")
+    if len(d) < 10:
+        return None
+    t0    = d["TimeStamp"].iloc[0]
+    secs  = (d["TimeStamp"] - t0).dt.total_seconds().values
+    yval  = d["Value_Num"].values.astype(float)
+    diffs = np.diff(secs)
+    step_s = float(np.median(diffs)) if len(diffs) > 0 else 60.0
+    return {"d": d, "secs": secs, "yval": yval, "step_s": step_s,
+            "t0": t0, "ts": d["TimeStamp"]}
+
+
+def _compute_acf_values(values: np.ndarray, nlags: int) -> tuple[np.ndarray, float]:
+    n = len(values)
+    x = values - np.mean(values)
+    denom = float(np.dot(x, x))
+    if denom == 0:
+        return np.zeros(nlags + 1), 1.96 / np.sqrt(max(n, 1))
+    acf_vals = [1.0]
+    for k in range(1, nlags + 1):
+        c = float(np.dot(x[:n - k], x[k:])) / denom
+        acf_vals.append(c)
+    ci = 1.96 / np.sqrt(n)
+    return np.array(acf_vals), ci
+
+
+def _compute_pacf_values(values: np.ndarray, nlags: int) -> tuple[np.ndarray, float]:
+    acf_vals, ci = _compute_acf_values(values, nlags)
+    pacf_vals = [1.0]
+    if nlags >= 1:
+        pacf_vals.append(float(acf_vals[1]))
+    phi = np.array([acf_vals[1]]) if nlags >= 1 else np.array([])
+    var  = max(1.0 - acf_vals[1] ** 2, 1e-10) if nlags >= 1 else 1.0
+    for k in range(2, nlags + 1):
+        numerator   = acf_vals[k] - float(np.dot(phi, acf_vals[k - 1:0:-1]))
+        phi_k       = numerator / max(var, 1e-10)
+        phi_k       = max(-0.99, min(0.99, phi_k))
+        new_phi     = phi - phi_k * phi[::-1]
+        phi         = np.append(new_phi, phi_k)
+        var         = max(var * (1.0 - phi_k ** 2), 1e-10)
+        pacf_vals.append(float(phi_k))
+    ci = 1.96 / np.sqrt(len(values))
+    return np.array(pacf_vals), ci
+
+
+def _corr_bar_chart(corr_vals: np.ndarray, ci: float, title: str) -> alt.Chart:
+    nlags = len(corr_vals) - 1
+    data  = pd.DataFrame({"lag": list(range(nlags + 1)), "corr": corr_vals.tolist()})
+    bars  = (
+        alt.Chart(data)
+        .mark_bar(size=6, color="#3b82f6")
+        .encode(
+            x=alt.X("lag:Q", title="Lag"),
+            y=alt.Y("corr:Q", title="Correlacion",
+                    scale=alt.Scale(domain=[-1.1, 1.1])),
+            color=alt.condition(
+                alt.datum.corr > 0,
+                alt.value("#3b82f6"), alt.value("#ef4444"),
+            ),
+            tooltip=[alt.Tooltip("lag:Q"), alt.Tooltip("corr:Q", format=".4f")],
+        )
+    )
+    ci_df    = pd.DataFrame({"y": [ci, -ci]})
+    ci_lines = (
+        alt.Chart(ci_df)
+        .mark_rule(color="#f59e0b", strokeDash=[4, 2])
+        .encode(y="y:Q")
+    )
+    zero = (
+        alt.Chart(pd.DataFrame({"y": [0.0]}))
+        .mark_rule(color="#6b7280", size=1)
+        .encode(y="y:Q")
+    )
+    return alt.layer(ci_lines, zero, bars).properties(title=title, height=220)
+
+
+def _forecast_overlays_from_arrays(
+    future_y: np.ndarray, future_ts: list, yval: np.ndarray,
+    t_last, residuals: np.ndarray, label: str, color: str = "#8b5cf6",
+) -> list[dict]:
+    """Construye overlays series + series_band + vline desde arrays de forecast."""
+    n_pts = len(future_y)
+    sigma = float(np.std(residuals, ddof=0)) if len(residuals) > 1 else float(np.std(yval) * 0.1)
+    anchor = {"t": t_last.isoformat(), "y": round(float(yval[-1]), 4)}
+    data_pts = [anchor] + [
+        {"t": ts.isoformat(), "y": round(float(y), 4)}
+        for ts, y in zip(future_ts, future_y)
+    ]
+    lower_pts = [anchor]
+    upper_pts = [anchor]
+    for i, (ts, y) in enumerate(zip(future_ts, future_y)):
+        ci = 1.96 * sigma * (1.0 + (i / max(n_pts, 1)) * 0.6)
+        lower_pts.append({"t": ts.isoformat(), "y": round(float(y - ci), 4)})
+        upper_pts.append({"t": ts.isoformat(), "y": round(float(y + ci), 4)})
+    return [
+        {"type": "series_band", "lower": lower_pts, "upper": upper_pts,
+         "color": color, "opacity": 0.13},
+        {"type": "series", "data": data_pts, "color": color,
+         "dashed": True, "width": 2.5, "label": label},
+        {"type": "vline", "timestamp": t_last.isoformat(),
+         "color": color, "dashed": True, "label": ""},
+    ]
+
+
+def _build_future_timestamps(t0, last_s: float, step_s: float, n_pts: int):
+    return [t0 + pd.Timedelta(seconds=last_s + step_s * (i + 1)) for i in range(n_pts)]
+
+
+# ---- ACF ----
+def _analysis_acf(df, nlags: int = 40) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para ACF."}
+    acf_vals, ci = _compute_acf_values(ts["yval"], nlags)
+    chart = _corr_bar_chart(acf_vals, ci, f"ACF — Autocorrelacion (n={len(ts['yval'])})")
+    sig = int(np.sum(np.abs(acf_vals[1:]) > ci))
+    return {
+        "overlays": [],
+        "sub_charts": [{"title": "📊 ACF — Funcion de Autocorrelacion",
+                         "type": "altair", "chart": chart}],
+        "explanation": (
+            f"ACF calculada con {nlags} lags. "
+            f"**{sig}** lag(s) superan el intervalo de confianza (IC = ±{ci:.3f}). "
+            "Lags significativos sugieren estructura temporal aprovechable para modelos AR/MA."
+        ),
+    }
+
+
+# ---- PACF ----
+def _analysis_pacf(df, nlags: int = 40) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para PACF."}
+    pacf_vals, ci = _compute_pacf_values(ts["yval"], nlags)
+    chart = _corr_bar_chart(pacf_vals, ci, f"PACF — Autocorrelacion Parcial (n={len(ts['yval'])})")
+    sig_lags = [k for k, v in enumerate(pacf_vals[1:], 1) if abs(v) > ci]
+    p_suggest = sig_lags[-1] if sig_lags else 1
+    return {
+        "overlays": [],
+        "sub_charts": [{"title": "📊 PACF — Autocorrelacion Parcial",
+                         "type": "altair", "chart": chart}],
+        "explanation": (
+            f"PACF calculada con {nlags} lags. "
+            f"Lags significativos: {sig_lags[:10]}. "
+            f"Orden p sugerido para AR: **{p_suggest}**."
+        ),
+    }
+
+
+# ---- AR ----
+def _analysis_ar(df, horizon_s: float) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para AR."}
+    yval, secs, step_s, t0 = ts["yval"], ts["secs"], ts["step_s"], ts["t0"]
+    n = len(yval)
+
+    # Seleccionar orden p via PACF
+    max_p = min(20, n // 5)
+    pacf_vals, ci = _compute_pacf_values(yval, max_p)
+    sig_lags = [k for k, v in enumerate(pacf_vals[1:], 1) if abs(v) > ci]
+    p = sig_lags[-1] if sig_lags else min(5, max_p)
+    p = max(1, min(p, max_p))
+
+    if _HAS_STATSMODELS:
+        try:
+            mdl = _AutoReg(yval, lags=p, old_names=False).fit()
+            residuals = mdl.resid
+            n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
+            future_y = mdl.forecast(steps=n_pts)
+            future_ts = _build_future_timestamps(t0, float(secs[-1]), step_s, n_pts)
+            info = f"AR({p}) via statsmodels — AIC={mdl.aic:.2f}, BIC={mdl.bic:.2f}"
+        except Exception as e:
+            _HAS_STATSMODELS_local = False
+            info = f"AR({p}) fallback numpy (statsmodels error: {e})"
+            residuals, future_y, future_ts = None, None, None
+    else:
+        _HAS_STATSMODELS_local = False
+        info = f"AR({p}) numpy"
+        residuals, future_y, future_ts = None, None, None
+
+    if future_y is None:
+        # Numpy fallback
+        X = np.stack([yval[i: n - p + i] for i in range(p)], axis=1)
+        y_train = yval[p:]
+        coeffs, _, _, _ = np.linalg.lstsq(X, y_train, rcond=None)
+        residuals = y_train - X @ coeffs
+        n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
+        buf = list(yval[-p:])
+        future_y_list = []
+        for _ in range(n_pts):
+            yh = float(np.dot(buf, coeffs))
+            future_y_list.append(yh)
+            buf = buf[1:] + [yh]
+        future_y = np.array(future_y_list)
+        future_ts = _build_future_timestamps(t0, float(secs[-1]), step_s, n_pts)
+
+    t_last = ts["ts"].iloc[-1]
+    overlays = _forecast_overlays_from_arrays(
+        future_y, future_ts, yval, t_last, residuals, f"AR({p})", "#6366f1"
+    )
+    return {"overlays": overlays, "sub_charts": [], "explanation": info}
+
+
+# ---- MA ----
+def _analysis_ma(df, horizon_s: float) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para MA."}
+    yval, secs, step_s, t0 = ts["yval"], ts["secs"], ts["step_s"], ts["t0"]
+
+    if _HAS_STATSMODELS:
+        try:
+            # Detect q via ACF
+            acf_v, ci = _compute_acf_values(yval, min(20, len(yval) // 5))
+            sig_q = [k for k, v in enumerate(acf_v[1:], 1) if abs(v) > ci]
+            q = sig_q[-1] if sig_q else 2
+            q = max(1, min(q, 10))
+            mdl = _ARIMA(yval, order=(0, 0, q)).fit()
+            residuals = mdl.resid
+            n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
+            fc = mdl.forecast(steps=n_pts)
+            future_ts = _build_future_timestamps(t0, float(secs[-1]), step_s, n_pts)
+            t_last = ts["ts"].iloc[-1]
+            overlays = _forecast_overlays_from_arrays(
+                fc, future_ts, yval, t_last, residuals, f"MA({q})", "#0ea5e9"
+            )
+            info = f"MA({q}) via statsmodels — AIC={mdl.aic:.2f}"
+        except Exception as e:
+            return {"error": f"MA fallido: {e}"}
+    else:
+        # Approximation: EWM-based MA-like forecast
+        span = min(10, len(yval) // 5)
+        smoothed = pd.Series(yval).ewm(span=span, adjust=False).mean().values
+        residuals = yval - smoothed
+        n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
+        future_y = np.full(n_pts, float(smoothed[-1]))  # constant forecast
+        future_ts = _build_future_timestamps(t0, float(secs[-1]), step_s, n_pts)
+        t_last = ts["ts"].iloc[-1]
+        overlays = _forecast_overlays_from_arrays(
+            future_y, future_ts, yval, t_last, residuals, f"MA(approx,span={span})", "#0ea5e9"
+        )
+        info = "MA aproximado con EWM (instala statsmodels para MA exacto)"
+
+    return {"overlays": overlays, "sub_charts": [], "explanation": info}
+
+
+# ---- ARIMA ----
+def _analysis_arima(df, horizon_s: float) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para ARIMA."}
+    yval, secs, step_s, t0 = ts["yval"], ts["secs"], ts["step_s"], ts["t0"]
+
+    if not _HAS_STATSMODELS:
+        return {"error": "ARIMA requiere statsmodels. Instala con: pip install statsmodels"}
+
+    try:
+        # Auto-select orders: try (2,1,2), (1,1,1), (1,0,1), fall back to (1,1,0)
+        best_aic = float("inf")
+        best_mdl = None
+        best_order = (1, 1, 1)
+        for order in [(1, 1, 1), (2, 1, 2), (1, 0, 1), (1, 1, 0), (0, 1, 1)]:
+            try:
+                m = _ARIMA(yval, order=order).fit()
+                if m.aic < best_aic:
+                    best_aic  = m.aic
+                    best_mdl  = m
+                    best_order = order
+            except Exception:
+                pass
+        if best_mdl is None:
+            return {"error": "No se pudo ajustar ninguna variante ARIMA."}
+
+        n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
+        fc    = best_mdl.forecast(steps=n_pts)
+        residuals = best_mdl.resid
+        future_ts = _build_future_timestamps(t0, float(secs[-1]), step_s, n_pts)
+        t_last = ts["ts"].iloc[-1]
+        overlays = _forecast_overlays_from_arrays(
+            fc, future_ts, yval, t_last, residuals,
+            f"ARIMA{best_order}", "#f59e0b"
+        )
+        info = f"ARIMA{best_order} — AIC={best_aic:.2f} (mejor de 5 variantes)"
+        return {"overlays": overlays, "sub_charts": [], "explanation": info}
+    except Exception as e:
+        return {"error": f"ARIMA fallido: {e}"}
+
+
+# ---- SARIMA ----
+def _analysis_sarima(df, horizon_s: float) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para SARIMA."}
+    yval, secs, step_s, t0 = ts["yval"], ts["secs"], ts["step_s"], ts["t0"]
+
+    if not _HAS_STATSMODELS:
+        return {"error": "SARIMA requiere statsmodels. Instala con: pip install statsmodels"}
+
+    try:
+        # Infer seasonal period from FFT
+        n = len(yval)
+        trend_coeffs = np.polyfit(np.arange(n), yval, 1)
+        detrended = yval - np.polyval(trend_coeffs, np.arange(n))
+        freqs = np.fft.rfftfreq(n)
+        mags  = np.abs(np.fft.rfft(detrended))
+        dom_freq = freqs[int(np.argmax(mags[1:])) + 1] if len(mags) > 1 else 0
+        s = int(round(1.0 / dom_freq)) if dom_freq > 0 else 12
+        s = max(2, min(s, max(2, n // 4)))
+
+        best_aic = float("inf")
+        best_mdl = None
+        best_order = ((1, 1, 1), (1, 0, 1, s))
+        for pdq in [(1, 1, 1), (1, 0, 1), (0, 1, 1)]:
+            for PDQ in [(1, 0, 1, s), (0, 1, 1, s)]:
+                try:
+                    m = _SARIMAX(yval, order=pdq, seasonal_order=PDQ,
+                                 enforce_stationarity=False,
+                                 enforce_invertibility=False).fit(disp=False)
+                    if m.aic < best_aic:
+                        best_aic   = m.aic
+                        best_mdl   = m
+                        best_order = (pdq, PDQ)
+                except Exception:
+                    pass
+        if best_mdl is None:
+            return {"error": f"No se pudo ajustar SARIMA con periodo s={s}."}
+
+        n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
+        fc    = best_mdl.forecast(steps=n_pts)
+        residuals = best_mdl.resid
+        future_ts = _build_future_timestamps(t0, float(secs[-1]), step_s, n_pts)
+        t_last = ts["ts"].iloc[-1]
+        overlays = _forecast_overlays_from_arrays(
+            fc, future_ts, yval, t_last, residuals,
+            f"SARIMA{best_order[0]}x{best_order[1]}", "#10b981"
+        )
+        info = f"SARIMA{best_order[0]}x{best_order[1]} — periodo s={s} — AIC={best_aic:.2f}"
+        return {"overlays": overlays, "sub_charts": [], "explanation": info}
+    except Exception as e:
+        return {"error": f"SARIMA fallido: {e}"}
+
+
+# ---- No Lineal (TAR — Threshold Autoregressive) ----
+def _analysis_nonlinear(df, horizon_s: float) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para modelo no lineal."}
+    yval, secs, step_s, t0 = ts["yval"], ts["secs"], ts["step_s"], ts["t0"]
+    n = len(yval)
+    threshold = float(np.median(yval))
+    p = max(1, min(5, n // 10))
+
+    # Fit two AR models: high and low regime
+    def fit_ar(y_all, mask, p_):
+        if np.sum(mask[p_:]) < p_ + 2:
+            return None, None
+        rows = [i for i in range(p_, len(y_all)) if mask[i]]
+        if len(rows) < p_ + 2:
+            return None, None
+        X = np.stack([y_all[i - p_:i] for i in rows], axis=0)
+        y_reg = np.array([y_all[i] for i in rows])
+        c, _, _, _ = np.linalg.lstsq(X, y_reg, rcond=None)
+        res = y_reg - X @ c
+        return c, res
+
+    high_mask = yval >= threshold
+    low_mask  = yval < threshold
+    c_high, r_high = fit_ar(yval, high_mask, p)
+    c_low,  r_low  = fit_ar(yval, low_mask,  p)
+
+    if c_high is None or c_low is None:
+        return {"error": "No hay suficientes datos en cada regimen para TAR."}
+
+    residuals = np.concatenate([r_high, r_low])
+    buf = list(yval[-p:])
+    n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
+    future_y_list = []
+    for _ in range(n_pts):
+        regime = "high" if buf[-1] >= threshold else "low"
+        coeffs = c_high if regime == "high" else c_low
+        yh = float(np.dot(buf, coeffs))
+        future_y_list.append(yh)
+        buf = buf[1:] + [yh]
+
+    future_y  = np.array(future_y_list)
+    future_ts = _build_future_timestamps(t0, float(secs[-1]), step_s, n_pts)
+    t_last = ts["ts"].iloc[-1]
+    overlays = _forecast_overlays_from_arrays(
+        future_y, future_ts, yval, t_last, residuals,
+        f"TAR(p={p}, umbral={threshold:.2f})", "#ec4899"
+    )
+    info = (
+        f"Modelo no lineal TAR con p={p}, umbral={threshold:.2f}. "
+        f"Regimen alto (≥{threshold:.2f}): {int(np.sum(high_mask))} puntos. "
+        f"Regimen bajo (<{threshold:.2f}): {int(np.sum(low_mask))} puntos."
+    )
+    return {"overlays": overlays, "sub_charts": [], "explanation": info}
+
+
+# ---- Comparacion de modelos ----
+def _analysis_compare(df) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para comparar modelos."}
+    yval, secs, step_s = ts["yval"], ts["secs"], ts["step_s"]
+    n = len(yval)
+    split = max(int(n * 0.8), n - 30)
+    y_train, y_test = yval[:split], yval[split:]
+    s_train, s_test = secs[:split], secs[split:]
+    if len(y_test) < 3:
+        return {"error": "No hay suficientes datos de prueba (necesita ≥ 15 puntos total)."}
+
+    results = []
+
+    def _rmse(a, b):
+        return float(np.sqrt(np.mean((a - b) ** 2)))
+
+    def _mae(a, b):
+        return float(np.mean(np.abs(a - b)))
+
+    n_test = len(y_test)
+
+    # 1. Linear
+    try:
+        c = np.polyfit(s_train, y_train, 1)
+        pred = np.polyval(c, s_test)
+        results.append({"Modelo": "Linear", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+    except Exception:
+        pass
+
+    # 2. Polynomial (degree=2)
+    try:
+        c = np.polyfit(s_train, y_train, 2)
+        pred = np.polyval(c, s_test)
+        results.append({"Modelo": "Polynomial(2)", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+    except Exception:
+        pass
+
+    # 3. Holt
+    try:
+        _, level, trend_holt = _holt_smooth(y_train, 0.3, 0.1)
+        avg_int = float(np.mean(np.diff(s_train))) if len(s_train) > 1 else step_s
+        trend_ps = trend_holt / max(avg_int, 1.0)
+        pred = np.array([level + trend_ps * (step_s * (i + 1)) for i in range(n_test)])
+        results.append({"Modelo": "Holt", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+    except Exception:
+        pass
+
+    # 4. AR (numpy)
+    try:
+        p = min(5, len(y_train) // 5)
+        X = np.stack([y_train[i: len(y_train) - p + i] for i in range(p)], axis=1)
+        y_reg = y_train[p:]
+        coeffs_ar, _, _, _ = np.linalg.lstsq(X, y_reg, rcond=None)
+        buf = list(y_train[-p:])
+        pred_ar = []
+        for _ in range(n_test):
+            yh = float(np.dot(buf, coeffs_ar))
+            pred_ar.append(yh)
+            buf = buf[1:] + [yh]
+        pred = np.array(pred_ar)
+        results.append({"Modelo": f"AR({p})", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+    except Exception:
+        pass
+
+    # 5. ARIMA (statsmodels)
+    if _HAS_STATSMODELS:
+        try:
+            m = _ARIMA(y_train, order=(1, 1, 1)).fit()
+            pred = m.forecast(steps=n_test)
+            results.append({"Modelo": "ARIMA(1,1,1)", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+        except Exception:
+            pass
+
+    if not results:
+        return {"error": "No se pudo ajustar ningun modelo."}
+
+    df_res = pd.DataFrame(results).sort_values("RMSE").reset_index(drop=True)
+    df_res["RMSE"] = df_res["RMSE"].round(4)
+    df_res["MAE"]  = df_res["MAE"].round(4)
+    df_res.index  = range(1, len(df_res) + 1)
+    best = df_res.iloc[0]["Modelo"]
+
+    # Build bar chart for RMSE
+    bar_data = df_res.copy()
+    bar_data["rank"] = ["🥇 " + bar_data.iloc[0]["Modelo"]] + [
+        str(r) for r in bar_data.iloc[1:]["Modelo"]
+    ]
+    chart = (
+        alt.Chart(bar_data)
+        .mark_bar()
+        .encode(
+            y=alt.Y("Modelo:N", sort="-x", title="Modelo"),
+            x=alt.X("RMSE:Q", title="RMSE (menor = mejor)"),
+            color=alt.condition(
+                alt.datum.Modelo == best,
+                alt.value("#10b981"), alt.value("#6b7280"),
+            ),
+            tooltip=["Modelo:N",
+                     alt.Tooltip("RMSE:Q", format=".4f"),
+                     alt.Tooltip("MAE:Q", format=".4f")],
+        )
+        .properties(title=f"Comparacion de modelos — {n_test} puntos de prueba", height=220)
+    )
+    explanation = (
+        f"**Mejor modelo: {best}** (RMSE={df_res.iloc[0]['RMSE']:.4f}, "
+        f"MAE={df_res.iloc[0]['MAE']:.4f}). "
+        f"Comparados {len(df_res)} modelos en {n_test} puntos de prueba (ultimo 20% de los datos)."
+    )
+    return {
+        "overlays": [],
+        "sub_charts": [
+            {"title": "🏆 Comparacion de Modelos (RMSE/MAE)",
+             "type": "altair", "chart": chart},
+            {"title": "📋 Tabla de Resultados",
+             "type": "table", "df": df_res},
+        ],
+        "explanation": explanation,
+    }
+
+
+# ---- Analisis Residual ----
+def _analysis_residuals(df) -> dict:
+    ts = _prep_ts_data(df)
+    if ts is None:
+        return {"error": "Se necesitan datos numericos con timestamps para analisis residual."}
+    yval, secs, step_s, t0 = ts["yval"], ts["secs"], ts["step_s"], ts["t0"]
+    n = len(yval)
+    p = min(5, n // 10)
+
+    # Fit AR(p) to get residuals
+    if p >= 1:
+        X = np.stack([yval[i: n - p + i] for i in range(p)], axis=1)
+        y_reg = yval[p:]
+        coeffs, _, _, _ = np.linalg.lstsq(X, y_reg, rcond=None)
+        residuals = y_reg - X @ coeffs
+        t_res = ts["ts"].iloc[p:].reset_index(drop=True)
+        info_model = f"Residuos de AR({p})"
+    else:
+        coeffs_lin = np.polyfit(secs, yval, 1)
+        residuals  = yval - np.polyval(coeffs_lin, secs)
+        t_res = ts["ts"].reset_index(drop=True)
+        info_model = "Residuos de regresion lineal"
+
+    # Residuals over time
+    df_resid = pd.DataFrame({"t": t_res.values, "residual": residuals})
+    res_chart = (
+        alt.Chart(df_resid)
+        .mark_line(color="#6366f1", size=1.5)
+        .encode(
+            x=alt.X("t:T", title="Tiempo"),
+            y=alt.Y("residual:Q", title="Residuo"),
+            tooltip=[alt.Tooltip("t:T"), alt.Tooltip("residual:Q", format=".4f")],
+        )
+        .properties(title=f"Residuos en el tiempo ({info_model})", height=200)
+    )
+    zero_line = (
+        alt.Chart(pd.DataFrame({"y": [0.0]}))
+        .mark_rule(color="#ef4444", strokeDash=[4, 2])
+        .encode(y="y:Q")
+    )
+    res_chart = alt.layer(res_chart, zero_line)
+
+    # Rolling variance (homocedasticidad)
+    window = max(5, len(residuals) // 10)
+    roll_var = pd.Series(residuals).rolling(window).var().values
+    df_rv = pd.DataFrame({"t": t_res.values, "var": roll_var})
+    rv_chart = (
+        alt.Chart(df_rv.dropna())
+        .mark_area(color="#f59e0b", opacity=0.4)
+        .encode(
+            x=alt.X("t:T", title="Tiempo"),
+            y=alt.Y("var:Q", title="Varianza movil"),
+        )
+        .properties(title=f"Varianza movil de residuos (ventana={window}) — homocedasticidad", height=160)
+    )
+
+    # ACF of residuals
+    acf_r, ci_r = _compute_acf_values(residuals, min(30, len(residuals) // 3))
+    acf_chart = _corr_bar_chart(acf_r, ci_r, "ACF de residuos — debe ser ruido blanco")
+
+    sig_r = [k for k, v in enumerate(acf_r[1:], 1) if abs(v) > ci_r]
+    if not sig_r:
+        residual_verdict = "✅ Residuos parecen ruido blanco (sin autocorrelacion significativa)."
+    else:
+        residual_verdict = (
+            f"⚠️ Residuos tienen autocorrelacion en lags {sig_r[:5]} — "
+            "el modelo puede no capturar toda la estructura."
+        )
+
+    # Basic stats
+    mean_r = float(np.mean(residuals))
+    std_r  = float(np.std(residuals))
+
+    explanation = (
+        f"{info_model}. "
+        f"Media={mean_r:.4f}, Desv.Std={std_r:.4f}. "
+        f"{residual_verdict}"
+    )
+    return {
+        "overlays": [],
+        "sub_charts": [
+            {"title": "🔍 Residuos en el tiempo", "type": "altair", "chart": res_chart},
+            {"title": "📊 Varianza movil (homocedasticidad)", "type": "altair", "chart": rv_chart},
+            {"title": "📊 ACF de residuos", "type": "altair", "chart": acf_chart},
+        ],
+        "explanation": explanation,
+    }
+
+
+# ---- Dispatcher principal ----
+def _detect_analysis_command(prompt: str) -> str | None:
+    """Detecta que comando de analisis se solicita en el prompt. Retorna clave '@cmd' o None."""
+    p = prompt.lower().strip()
+
+    # Explicit @command
+    for cmd in _ANALYSIS_COMMANDS:
+        kw = cmd[1:]  # "acf", "pacf", "ar", ...
+        if p.startswith(f"@{kw}") or f" @{kw}" in p:
+            return cmd
+
+    # Keyword matching
+    for cmd, info in _ANALYSIS_COMMANDS.items():
+        for kw in info.get("keywords", []):
+            if kw and kw in p:
+                return cmd
+
+    return None
+
+
+def _dispatch_analysis_command(prompt: str, df, context) -> dict:
+    """Ejecuta el analisis correspondiente al comando detectado."""
+    cmd = _detect_analysis_command(prompt)
+    if cmd is None:
+        return {}
+
+    horizon_s = _parse_horizon_seconds(prompt) or 86400
+
+    if cmd == "@acf":
+        nlags = 40
+        for tok in prompt.split():
+            try:
+                v = int(tok)
+                if 5 <= v <= 200:
+                    nlags = v
+                    break
+            except ValueError:
+                pass
+        return _analysis_acf(df, nlags)
+
+    if cmd == "@pacf":
+        nlags = 40
+        for tok in prompt.split():
+            try:
+                v = int(tok)
+                if 5 <= v <= 200:
+                    nlags = v
+                    break
+            except ValueError:
+                pass
+        return _analysis_pacf(df, nlags)
+
+    if cmd == "@ar":
+        return _analysis_ar(df, horizon_s)
+
+    if cmd == "@ma":
+        return _analysis_ma(df, horizon_s)
+
+    if cmd == "@arima":
+        return _analysis_arima(df, horizon_s)
+
+    if cmd == "@sarima":
+        return _analysis_sarima(df, horizon_s)
+
+    if cmd == "@nonlinear":
+        return _analysis_nonlinear(df, horizon_s)
+
+    if cmd in ("@holt", "@seasonal"):
+        # Route to LLM-guided forecast with forced model
+        spec = {
+            "model": "holt" if cmd == "@holt" else "seasonal",
+            "params": {"alpha": 0.3, "beta": 0.1, "periods_back": 2},
+            "reasoning": f"Forzado por comando {cmd}",
+            "trend_direction": "variable",
+        }
+        overlays = _compute_model_series(spec, df, horizon_s)
+        if horizon_s >= 86400:
+            h = f"{horizon_s/86400:.1g}d"
+        else:
+            h = f"{horizon_s/3600:.1g}h"
+        return {
+            "overlays": overlays, "sub_charts": [],
+            "explanation": f"Prediccion {h} con modelo {spec['model']}",
+        }
+
+    if cmd == "@compare":
+        return _analysis_compare(df)
+
+    if cmd == "@residuals":
+        return _analysis_residuals(df)
+
+    # Visual overlays (@sigma, @movavg, @ewm) — pass through to local fallback
+    return {}
+
+
+# ==================================================================
 # Fragment: renderiza chart + panel IA como unidad aislada
 # (st.rerun() solo recarga este bloque, no la pagina entera)
 # ==================================================================
@@ -879,6 +2043,39 @@ def _chart_ai_fragment(state_key: str, store_key: str) -> None:
             st.rerun(scope="fragment")
 
     st.altair_chart(final_chart, use_container_width=True)
+
+    # -------- Resumen + codigo generado por la IA (si hubo @code reciente) --------
+    last_ai = state.get("_last_ai_code")
+    if last_ai:
+        msg = last_ai.get("summary", "")
+        if msg:
+            st.success(msg)
+        with st.expander("📜 Codigo generado por la IA", expanded=False):
+            st.code(last_ai.get("code", ""), language="python")
+            if last_ai.get("stdout"):
+                st.caption("**Salida del codigo:**")
+                st.code(last_ai["stdout"], language="text")
+        col_a, col_b = st.columns([1, 6])
+        with col_a:
+            if st.button("🗑 Ocultar codigo", key=f"{state_key}_hide_code",
+                         help="Ocultar el codigo y el resumen"):
+                state["_last_ai_code"] = None
+                st.rerun(scope="fragment")
+
+    # -------- Sub-charts (ACF, PACF, residuos, comparacion) --------
+    if state.get("sub_charts"):
+        for sub in state["sub_charts"]:
+            with st.expander(sub["title"], expanded=True):
+                if sub["type"] == "altair":
+                    st.altair_chart(sub["chart"], use_container_width=True)
+                elif sub["type"] == "table":
+                    st.dataframe(sub["df"], use_container_width=True)
+                elif sub["type"] == "markdown":
+                    st.markdown(sub.get("content", ""))
+        if st.button("🗑 Limpiar análisis", key=f"{state_key}_clear_sub",
+                     help="Ocultar graficas de analisis estadistico"):
+            state["sub_charts"] = []
+            st.rerun(scope="fragment")
 
     # -------- Badge de capas activas / boton limpiar contextual --------
     # Leer directo del widget para que el badge sea inmediato sin rerun extra
@@ -963,6 +2160,8 @@ def chart_with_ai(
             "history": [],
             "last_explanation": "",
             "_mode": "🎨 Modificar grafica",
+            "sub_charts": [],
+            "_show_cmds": False,
         }
 
     # Guardar chart/df en session_state para que el fragment los acceda en re-runs
@@ -990,86 +2189,960 @@ _SIMPLE_PREDICT_WORDS = (
 )
 
 
+def _exec_analysis_in_place(
+    template: str, df, context: dict | None, state: dict, state_key: str
+) -> bool:
+    """
+    Ejecuta un comando de analisis directamente (desde click en sugerencia).
+    Retorna True si fue manejado, False si debe pasar por el pipeline de texto.
+    """
+    result = _dispatch_analysis_command(template, df, context)
+    if not result:
+        return False  # comando visual (@sigma etc.) — pasa al pipeline normal
+    if "error" in result:
+        st.error(result["error"])
+        if not _HAS_STATSMODELS and "statsmodels" in result.get("error", ""):
+            st.code("pip install statsmodels", language="bash")
+        return True
+    new_overlays = result.get("overlays", [])
+    new_sub      = result.get("sub_charts", [])
+    explanation  = result.get("explanation", "")
+    if new_overlays:
+        state["overlays"].extend(new_overlays)
+    if new_sub:
+        state["sub_charts"] = state.get("sub_charts", []) + new_sub
+    state["last_explanation"] = explanation
+    state["_show_cmds"] = False
+    pkey = f"{state_key}_prompt_val"
+    if pkey in st.session_state:
+        del st.session_state[pkey]
+    return True
+
+
+def _render_cmd_suggestions(
+    state: dict, state_key: str, df, context, filter_str: str = ""
+) -> None:
+    """
+    Renderiza el panel de sugerencias de comandos @.
+    filter_str: lo que el usuario escribio despues del @, para filtrar en tiempo real.
+    """
+    categories: dict[str, list] = {}
+    for cmd, info in _ANALYSIS_COMMANDS.items():
+        if filter_str:
+            searchable = (
+                cmd[1:] + " " + info["label"] + " " + info["desc"] + " " +
+                " ".join(info.get("keywords", []))
+            ).lower()
+            if filter_str not in searchable:
+                continue
+        cat = info.get("category", "General")
+        categories.setdefault(cat, []).append((cmd, info))
+
+    if not categories:
+        st.caption(f"_Sin resultados para `@{filter_str}` — prueba: acf, arima, compare, residuals…_")
+        return
+
+    header = (
+        f"Sugerencias para **`@{filter_str}`** — haz clic para ejecutar:"
+        if filter_str else
+        "**Comandos @ disponibles** — haz clic para ejecutar directamente en la gráfica:"
+    )
+    with st.container(border=True):
+        st.caption(header)
+        for cat, cmds in sorted(categories.items()):
+            st.markdown(
+                f"<small style='color:#9ca3af'><b>{cat}</b></small>",
+                unsafe_allow_html=True,
+            )
+            n_cols = min(len(cmds), 3)
+            cols = st.columns(n_cols)
+            for i, (cmd, info) in enumerate(cmds):
+                with cols[i % n_cols]:
+                    if st.button(
+                        info["label"],
+                        key=f"{state_key}_cmd_{cmd}",
+                        help=info["desc"],
+                        use_container_width=True,
+                    ):
+                        executed = _exec_analysis_in_place(
+                            info["template"], df, context, state, state_key
+                        )
+                        if executed:
+                            st.rerun()
+                        else:
+                            # Comando visual: pre-poblar input y ejecutar al aplicar
+                            state["_pending_prompt"] = info["template"]
+                            state["_show_cmds"] = False
+                            st.rerun(scope="fragment")
+                    # Descripcion breve visible bajo el boton
+                    short = info["desc"][:62] + "…" if len(info["desc"]) > 62 else info["desc"]
+                    st.caption(f"_{short}_")
+
+
+def _inject_autocomplete_js(input_key: str, submit_btn_key: str) -> None:
+    """
+    Inyecta JS via components.html (iframe same-origin) para:
+    1. Dropdown morado con sugerencias @ en tiempo real
+    2. Color/tipografia morada del input cuando empieza con '@'
+    3. Submit con Enter
+    NOTA: st.markdown(unsafe_allow_html) NO ejecuta <script> en React —
+          components.html() ejecuta JS correctamente y puede acceder a
+          window.parent.document por ser same-origin.
+    """
+    import streamlit.components.v1 as _stcomp
+
+    cmds_json = json.dumps([
+        {"cmd": cmd, "label": info["label"], "desc": info["desc"],
+         "cat": info.get("category", "General")}
+        for cmd, info in _ANALYSIS_COMMANDS.items()
+    ])
+
+    html = f"""<!DOCTYPE html>
+<html><head><style>body{{margin:0;padding:0;overflow:hidden;}}</style></head>
+<body><script>
+(function() {{
+  const CMDS = {cmds_json};
+  let dropdown = null;
+
+  function findInput() {{
+    try {{
+      const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+      for (const inp of inputs) {{
+        if (inp.placeholder && inp.placeholder.includes('@')) return inp;
+      }}
+    }} catch(e) {{}}
+    return null;
+  }}
+
+  function findApplyBtn() {{
+    try {{
+      const btns = window.parent.document.querySelectorAll('button');
+      for (const b of btns) {{
+        if (b.innerText && b.innerText.includes('Aplicar')) return b;
+      }}
+    }} catch(e) {{}}
+    return null;
+  }}
+
+  // ---- Text-overlay para colorear @cmd en morado y el resto normal ----
+  // Un <input> no puede tener colores mixtos, asi que hacemos el texto del input
+  // transparente y ponemos un <div> encima que renderiza las partes con sus colores.
+  // NOTA: NO usar innerHTML con font-family entre comillas simples — Python f-string
+  // convierte \' en ' y rompe la sintaxis JS. Usamos textContent + style.xxx en su lugar.
+  let textOverlay = null;
+
+  function createTextOverlay() {{
+    const doc = window.parent.document;
+    const el  = doc.createElement('div');
+    el.id     = 'chatai_tovl_{input_key}';
+    el.style.cssText = 'position:fixed;pointer-events:none;z-index:9998;display:flex;align-items:center;overflow:hidden;white-space:pre;box-sizing:border-box;';
+    doc.body.appendChild(el);
+    return el;
+  }}
+
+  function syncOverlay(inp, val) {{
+    if (!textOverlay) textOverlay = createTextOverlay();
+    const r  = inp.getBoundingClientRect();
+    const cs = window.parent.getComputedStyle(inp);
+
+    // Guardar el color natural del texto (antes de poner transparent) la primera vez
+    if (!inp['_chatai_natural_color_{input_key}']) {{
+      const nc = cs.color;
+      if (nc && nc !== 'transparent' && nc !== 'rgba(0, 0, 0, 0)') {{
+        inp['_chatai_natural_color_{input_key}'] = nc;
+      }}
+    }}
+    const naturalColor = inp['_chatai_natural_color_{input_key}'] || '#1f2937';
+
+    textOverlay.style.top           = r.top    + 'px';
+    textOverlay.style.left          = r.left   + 'px';
+    textOverlay.style.width         = r.width  + 'px';
+    textOverlay.style.height        = r.height + 'px';
+    textOverlay.style.fontSize      = cs.fontSize;
+    textOverlay.style.lineHeight    = cs.lineHeight;
+    textOverlay.style.paddingLeft   = cs.paddingLeft;
+    textOverlay.style.paddingRight  = cs.paddingRight;
+    textOverlay.style.paddingTop    = cs.paddingTop;
+    textOverlay.style.paddingBottom = cs.paddingBottom;
+    textOverlay.style.boxSizing     = cs.boxSizing;
+    textOverlay.style.background    = 'transparent';
+
+    if (val && val.startsWith('@')) {{
+      inp.style.color       = 'transparent';
+      inp.style.caretColor  = naturalColor;
+      inp.style.borderColor = '#7c3aed';
+      inp.style.boxShadow   = '0 0 0 2px rgba(124,58,237,.35)';
+
+      const doc      = window.parent.document;
+      const spaceIdx = val.indexOf(' ');
+      const cmdText  = spaceIdx === -1 ? val : val.slice(0, spaceIdx);
+      const restText = spaceIdx === -1 ? ''  : val.slice(spaceIdx);
+
+      textOverlay.innerHTML = '';
+
+      const cmdSpan = doc.createElement('span');
+      cmdSpan.textContent      = cmdText;
+      cmdSpan.style.color      = '#a78bfa';
+      cmdSpan.style.fontFamily = 'JetBrains Mono, monospace';
+      cmdSpan.style.fontWeight = '700';
+      textOverlay.appendChild(cmdSpan);
+
+      if (restText) {{
+        const restSpan = doc.createElement('span');
+        restSpan.textContent      = restText;
+        restSpan.style.color      = naturalColor;
+        restSpan.style.fontFamily = cs.fontFamily;
+        restSpan.style.fontWeight = 'normal';
+        textOverlay.appendChild(restSpan);
+      }}
+      textOverlay.style.display = 'flex';
+    }} else {{
+      inp.style.color       = '';
+      inp.style.caretColor  = '';
+      inp.style.borderColor = '';
+      inp.style.boxShadow   = '';
+      textOverlay.style.display = 'none';
+    }}
+  }}
+
+  function createDropdown() {{
+    const doc = window.parent.document;
+    const el = doc.createElement('div');
+    el.id = 'chatai_dd_{input_key}';
+    el.style.cssText = [
+      'position:fixed','z-index:999999',
+      'background:#0e1117',
+      'border:1.5px solid #7c3aed',
+      'border-radius:10px',
+      'max-height:320px','overflow-y:auto',
+      'min-width:360px',
+      'box-shadow:0 12px 32px rgba(124,58,237,.3),0 4px 12px rgba(0,0,0,.6)',
+      'display:none',
+      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+    ].join(';');
+    doc.body.appendChild(el);
+    return el;
+  }}
+
+  function positionDropdown(inp, dd) {{
+    const r = inp.getBoundingClientRect();
+    dd.style.top   = (r.bottom + 4) + 'px';
+    dd.style.left  = r.left + 'px';
+    dd.style.width = Math.max(r.width, 360) + 'px';
+  }}
+
+  function buildDropdown(filter, inp, dd) {{
+    const f = filter.toLowerCase().trim();
+    const matches = CMDS.filter(c =>
+      !f || c.cmd.slice(1).includes(f) ||
+      c.label.toLowerCase().includes(f) ||
+      c.desc.toLowerCase().includes(f)
+    );
+    dd.innerHTML = '';
+    if (!matches.length) {{ dd.style.display = 'none'; return; }}
+
+    const cats = {{}};
+    matches.forEach(c => {{ (cats[c.cat] = cats[c.cat] || []).push(c); }});
+
+    let first = true;
+    Object.entries(cats).forEach(([cat, items]) => {{
+      const doc = window.parent.document;
+      const catEl = doc.createElement('div');
+      catEl.style.cssText =
+        'padding:6px 14px 3px;font-size:10px;color:#6b7280;font-weight:700;' +
+        'text-transform:uppercase;letter-spacing:.07em;' +
+        (first ? '' : 'border-top:1px solid #1f2937;');
+      first = false;
+      catEl.textContent = cat;
+      dd.appendChild(catEl);
+
+      items.forEach(c => {{
+        const row = doc.createElement('div');
+        row.dataset.value = c.cmd;
+        row.style.cssText = 'padding:8px 14px 7px;cursor:pointer;transition:background .1s;';
+        row.innerHTML =
+          '<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">' +
+          '<span style="font-size:12px;color:#a78bfa;font-family:monospace;font-weight:700;' +
+          'background:#2d1f4a;padding:1px 6px;border-radius:4px;">' + c.cmd + '</span>' +
+          '<span style="font-size:13px;color:#e2e8f0;font-weight:500;">' + c.label + '</span>' +
+          '</div>' +
+          '<div style="font-size:11px;color:#6b7280;">' + c.desc + '</div>';
+        row.addEventListener('mouseenter', () => {{
+          dd.querySelectorAll('.chatai-active').forEach(x => {{ x.style.background=''; x.classList.remove('chatai-active'); }});
+          row.style.background = '#1e1635'; row.classList.add('chatai-active');
+        }});
+        row.addEventListener('mouseleave', () => {{ row.style.background = ''; row.classList.remove('chatai-active'); }});
+        row.addEventListener('mousedown', e => {{ e.preventDefault(); selectCmd(c.cmd, inp, dd); }});
+        dd.appendChild(row);
+      }});
+    }});
+
+    positionDropdown(inp, dd);
+    dd.style.display = 'block';
+  }}
+
+  function selectCmd(cmd, inp, dd) {{
+    // Insertar el comando + espacio para que el usuario pueda agregar instrucciones.
+    // NO auto-ejecutar; el usuario presiona Enter o el boton cuando este listo.
+    const val = cmd + ' ';
+    try {{
+      const setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, val);
+    }} catch(e) {{ inp.value = val; }}
+    inp.dispatchEvent(new window.parent.Event('input',  {{ bubbles: true }}));
+    inp.dispatchEvent(new window.parent.Event('change', {{ bubbles: true }}));
+    dd.style.display = 'none';
+    syncOverlay(inp, val);  // val tiene espacio -> instrucciones en estilo normal
+    inp.focus();
+    // Mover cursor al final
+    try {{ inp.setSelectionRange(val.length, val.length); }} catch(e) {{}}
+  }}
+
+  function attachToInput(inp) {{
+    if (inp['_chatai_{input_key}']) return;
+    inp['_chatai_{input_key}'] = true;
+
+    if (!dropdown) dropdown = createDropdown();
+    syncOverlay(inp, inp.value);
+
+    inp.addEventListener('input', () => {{
+      const val = inp.value;
+      syncOverlay(inp, val);
+      if (val.startsWith('@')) buildDropdown(val.slice(1), inp, dropdown);
+      else dropdown.style.display = 'none';
+    }});
+
+    inp.addEventListener('keydown', e => {{
+      const ddVisible = dropdown && dropdown.style.display !== 'none';
+      if (ddVisible) {{
+        const rows   = [...dropdown.querySelectorAll('[data-value]')];
+        const active = dropdown.querySelector('.chatai-active');
+        if (e.key === 'ArrowDown') {{
+          e.preventDefault();
+          const next = rows[(active ? rows.indexOf(active)+1 : 0) % rows.length];
+          if (active) {{ active.style.background=''; active.classList.remove('chatai-active'); }}
+          next.style.background = '#1e1635'; next.classList.add('chatai-active'); return;
+        }}
+        if (e.key === 'ArrowUp') {{
+          e.preventDefault();
+          const idx  = active ? rows.indexOf(active) : rows.length;
+          const prev = rows[(idx-1+rows.length) % rows.length];
+          if (active) {{ active.style.background=''; active.classList.remove('chatai-active'); }}
+          prev.style.background = '#1e1635'; prev.classList.add('chatai-active'); return;
+        }}
+        if (e.key === 'Enter') {{
+          e.preventDefault();
+          if (active) selectCmd(active.dataset.value, inp, dropdown);
+          else {{ dropdown.style.display='none'; const b=findApplyBtn(); if(b) b.click(); }}
+          return;
+        }}
+        if (e.key === 'Escape') {{ dropdown.style.display='none'; return; }}
+      }} else if (e.key === 'Enter' && !e.shiftKey) {{
+        e.preventDefault();
+        const b = findApplyBtn(); if (b) b.click();
+      }}
+    }});
+
+    inp.addEventListener('blur', () => {{ setTimeout(() => {{ if (dropdown) dropdown.style.display='none'; }}, 160); }});
+    window.parent.document.addEventListener('click', e => {{
+      if (dropdown && !dropdown.contains(e.target) && e.target !== inp) dropdown.style.display='none';
+    }}, true);
+    // Re-sync overlay position on scroll/resize
+    const repos = () => {{ if (textOverlay && textOverlay.style.display!=='none') syncOverlay(inp, inp.value); }};
+    window.parent.document.addEventListener('scroll', repos, true);
+    window.addEventListener('resize', () => {{
+      repos();
+      if (dropdown && dropdown.style.display!=='none') positionDropdown(inp, dropdown);
+    }});
+  }}
+
+  // ---- Limpiar divs flotantes de renders anteriores (Streamlit re-renderiza el iframe) ----
+  (function cleanup() {{
+    const old1 = window.parent.document.getElementById('chatai_tovl_{input_key}');
+    if (old1) old1.remove();
+    const old2 = window.parent.document.getElementById('chatai_dd_{input_key}');
+    if (old2) old2.remove();
+  }})();
+
+  // Retry loop \u2014 Streamlit renderiza el input de forma asincrona
+  let tries = 0;
+  let attachedInp = null;
+  const t = setInterval(() => {{
+    const inp = findInput();
+    if (inp) {{
+      attachToInput(inp);
+      attachedInp = inp;
+      clearInterval(t);
+
+      // Watchdog: limpia el overlay si el input ya no esta en el DOM
+      // (Streamlit a veces swap-ea el input sin reload del iframe) + re-sync posicion
+      setInterval(() => {{
+        // 1) Si el input desaparecio del DOM, esconder overlay + dropdown
+        if (!attachedInp || !attachedInp.isConnected) {{
+          if (textOverlay) textOverlay.style.display = 'none';
+          if (dropdown)    dropdown.style.display    = 'none';
+          // Reintentar encontrar el nuevo input
+          const freshInp = findInput();
+          if (freshInp && freshInp !== attachedInp) {{
+            attachedInp = freshInp;
+            attachToInput(freshInp);
+          }}
+          return;
+        }}
+        // 2) Polling de valor (Streamlit borra programaticamente sin disparar 'input')
+        const v = attachedInp.value;
+        const overlayShown = textOverlay && textOverlay.style.display !== 'none';
+        if (!v.startsWith('@') && overlayShown) syncOverlay(attachedInp, v);
+        // 3) Re-posicionar overlay si se movio (scroll interno, layout shift)
+        if (overlayShown) {{
+          const r = attachedInp.getBoundingClientRect();
+          if (Math.abs(parseFloat(textOverlay.style.top)  - r.top)  > 1 ||
+              Math.abs(parseFloat(textOverlay.style.left) - r.left) > 1) {{
+            syncOverlay(attachedInp, v);
+          }}
+        }}
+      }}, 200);
+    }}
+    if (++tries > 40) clearInterval(t);
+  }}, 200);
+}})();
+</script></body></html>
+"""
+    _stcomp.html(html, height=1, scrolling=False)
+
+
+# ---- LEGACY: kept for reference only, now replaced by _inject_autocomplete_js above ----
+def _inject_autocomplete_js_OLD(input_key: str, submit_btn_key: str) -> None:
+    """OLD — st.markdown script tags don't execute in React dangerouslySetInnerHTML."""
+    pass
+
+    js_code = f"""
+<datalist id="chatai_cmds_{input_key}">
+</datalist>
+<script>
+(function() {{
+  function findInput() {{
+    const all = document.querySelectorAll('input[type="text"]');
+    for (const el of all) {{
+      if (el.placeholder && el.placeholder.includes('@')) return el;
+    }}
+    return null;
+  }}
+
+  function attachAutocomplete(inp) {{
+    if (inp._chatai_attached) return;
+    inp._chatai_attached = true;
+
+    inp.addEventListener('input', () => {{
+      const val = inp.value;
+      if (val.startsWith('@')) {{
+        buildItems(val.slice(1));
+      }} else {{
+        dropdown.style.display = 'none';
+      }}
+    }});
+
+    inp.addEventListener('keydown', (e) => {{
+      if (dropdown.style.display !== 'none') {{
+        const active = dropdown.querySelector('.chatai-active');
+        const rows   = [...dropdown.querySelectorAll('[data-value]')];
+        if (e.key === 'ArrowDown') {{
+          e.preventDefault();
+          const idx = active ? rows.indexOf(active) : -1;
+          const next = rows[(idx + 1) % rows.length];
+          if (active) {{ active.style.background=''; active.classList.remove('chatai-active'); }}
+          next.style.background = '#2d3748';
+          next.classList.add('chatai-active');
+          return;
+        }}
+        if (e.key === 'ArrowUp') {{
+          e.preventDefault();
+          const idx = active ? rows.indexOf(active) : rows.length;
+          const prev = rows[(idx - 1 + rows.length) % rows.length];
+          if (active) {{ active.style.background=''; active.classList.remove('chatai-active'); }}
+          prev.style.background = '#2d3748';
+          prev.classList.add('chatai-active');
+          return;
+        }}
+        if (e.key === 'Enter' && active) {{
+          e.preventDefault();
+          selectItem(active.dataset.value);
+          return;
+        }}
+        if (e.key === 'Escape') {{
+          dropdown.style.display = 'none';
+          return;
+        }}
+      }}
+      if (e.key === 'Enter' && !e.shiftKey) {{
+        e.preventDefault();
+        submitPrompt();
+      }}
+    }});
+
+    document.addEventListener('click', (e) => {{
+      if (!dropdown.contains(e.target) && e.target !== inp) {{
+        dropdown.style.display = 'none';
+      }}
+    }});
+  }}
+
+  // Retry hasta encontrar el input (Streamlit renderiza async)
+  let attempts = 0;
+  const timer = setInterval(() => {{
+    const inp = findInput();
+    if (inp) {{ attachAutocomplete(inp); clearInterval(timer); }}
+    if (++attempts > 40) clearInterval(timer);
+  }}, 150);
+}})();
+</script>
+""".strip()
+    st.markdown(js_code, unsafe_allow_html=True)
+
+
+def _run_code_free_mode(instructions: str, state: dict, state_key: str, df, context, summary: dict) -> None:
+    """Modo @code: la IA genera Python con libertad total y se ejecuta en el sandbox."""
+    # Extraer spec Vega de la grafica actual
+    chart_spec: dict = {}
+    try:
+        _sk    = state_key.replace("chartai_", "")
+        _store = st.session_state.get(f"chartai_{_sk}_store", {})
+        _c     = _store.get("chart")
+        if _c is not None and hasattr(_c, "to_dict"):
+            full = _c.to_dict()
+            chart_spec = {
+                "mark":     full.get("mark"),
+                "encoding": full.get("encoding"),
+                "transform": full.get("transform"),
+                "width":    full.get("width"),
+                "height":   full.get("height"),
+            }
+    except Exception:
+        chart_spec = {}
+
+    current_overlays = [
+        {k: v for k, v in ov.items() if k != "data"}
+        for ov in state.get("overlays", [])
+    ]
+
+    # Resumen compacto: quitar recent_data/histogram_bins — el df completo ya esta disponible
+    # en el sandbox, no hay necesidad de serializar los puntos crudos (evita 500 por contexto largo)
+    compact_summary = {
+        k: v for k, v in summary.items()
+        if k not in ("recent_data", "histogram_bins", "correlation_pairs",
+                     "top_positive_correlations", "top_negative_correlations")
+    }
+    # Agregar muestra pequeña (10 filas) para que el modelo sepa columnas y tipos
+    if df is not None and not df.empty:
+        sample_rows = df.head(5).copy()
+        for col in sample_rows.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]):
+            sample_rows[col] = sample_rows[col].astype(str)
+        compact_summary["columns"] = list(df.columns)
+        compact_summary["sample_5_rows"] = sample_rows.to_dict(orient="records")
+
+    # Describir la spec de forma textual para no confundir al modelo con un JSON extra
+    spec_desc = ""
+    if chart_spec:
+        mark = chart_spec.get("mark") or {}
+        mark_type = mark.get("type", mark) if isinstance(mark, dict) else mark
+        enc = chart_spec.get("encoding") or {}
+        x_field = (enc.get("x") or {}).get("field", "?")
+        y_field = (enc.get("y") or {}).get("field", "?")
+        spec_desc = f"\n\nGrafica actual: tipo={mark_type}, eje X={x_field}, eje Y={y_field}"
+
+    user_msg = (
+        "Peticion del usuario: " + instructions
+        + f"\n\nDatos (resumen estadistico):\n{json.dumps(compact_summary, ensure_ascii=False, indent=2)}"
+        + (f"\n\nOverlays activos (labels): {[o.get('label','?') for o in current_overlays]}"
+           if current_overlays else "")
+        + spec_desc
+        + "\n\n---"
+        "\nRECORDATORIO CRITICO para este @code:\n"
+        "- Para marcar puntos discretos (anomalias, outliers) USA type=\"points\" (NO \"series\").\n"
+        "- SIEMPRE que el analisis produzca valores relevantes, agrega tambien una tabla en sub_charts (type=\"table\", df=<pd.DataFrame>).\n"
+        "- Rellena result['overlays'] Y result['sub_charts'] Y result['explanation'] — los 3 campos.\n"
+        "- Sin emojis ni markdown en explanation; texto llano en espanol.\n"
+        "\nResponde UNICAMENTE con:\n"
+        '{"mode":"code","python_code":"<codigo Python completo>","overlays":[],"explanation":"<descripcion>"}'
+    )
+
+    try:
+        with st.spinner("🧠 IA generando codigo personalizado..."):
+            # Usamos _CODE_SYSTEM (probado, funciona con force_json=True) forzando mode=code
+            result = chat_completion_json(_CODE_SYSTEM, user_msg, temperature=0.2)
+    except Exception as e:
+        st.error(f"Error contactando al modelo: {e}")
+        return
+
+    if "error" in result:
+        st.error("⚠️ No pude interpretar la respuesta del modelo.")
+        with st.expander("Respuesta cruda (debug)"):
+            st.code(result.get("raw", ""), language="text")
+        return
+
+    # Aceptar nombres alternativos que el modelo pueda usar
+    code = (
+        result.get("python_code")
+        or result.get("code")
+        or result.get("script")
+        or ""
+    )
+    explanation = result.get("explanation", "")
+
+    if not code:
+        # Si el modelo respondio mode=overlay en lugar de code, reintentamos con mensaje mas directo
+        if result.get("mode") == "overlay" or "overlays" in result:
+            st.warning("El modelo devolvio overlays en lugar de codigo. Reintentando...")
+            retry_msg = (
+                "Tu respuesta anterior uso mode='overlay' pero se requiere mode='code' con python_code. "
+                f"Peticion: {instructions}. "
+                "Responde con: {\"mode\":\"code\",\"python_code\":\"<codigo Python completo>\","
+                "\"overlays\":[],\"explanation\":\"<descripcion>\"}"
+            )
+            try:
+                result = chat_completion_json(_CODE_SYSTEM, retry_msg, temperature=0.1)
+                code = result.get("python_code") or result.get("code") or ""
+                explanation = result.get("explanation", "")
+            except Exception:
+                pass
+        if not code:
+            st.warning("La IA no genero codigo.")
+            with st.expander("Respuesta del modelo (debug)"):
+                st.json(result)
+            return
+
+    with st.spinner("⚙️ Ejecutando codigo generado..."):
+        exec_res = _execute_llm_code(code, df, chart_spec)
+
+    # Auto-retry: si el codigo falla, enviar el error al LLM para que lo corrija
+    if exec_res.get("error"):
+        err_short = exec_res["error"].split("\n")[0][:400]
+        with st.spinner("🔄 Codigo fallo, pidiendo correccion a la IA..."):
+            fix_msg = (
+                f"Tu codigo anterior fallo con este error:\n{err_short}\n\n"
+                f"Codigo original:\n```python\n{code}\n```\n\n"
+                "Corrige el error y devuelve el JSON de nuevo con el codigo arreglado. "
+                "RECUERDA: sklearn no acepta datetime — convierte TimeStamp a "
+                "(d['TimeStamp'].astype('int64') // 10**9).values.reshape(-1,1) antes de .fit()/.predict().\n"
+                f"Peticion original: {instructions}\n\n"
+                'Responde UNICAMENTE con {"mode":"code","python_code":"<codigo corregido>","overlays":[],"explanation":"<desc>"}'
+            )
+            try:
+                fix_result = chat_completion_json(_CODE_SYSTEM, fix_msg, temperature=0.1)
+                fixed_code = fix_result.get("python_code") or fix_result.get("code") or ""
+                if fixed_code:
+                    code = fixed_code
+                    explanation = fix_result.get("explanation", explanation)
+                    exec_res = _execute_llm_code(code, df, chart_spec)
+            except Exception:
+                pass
+
+    if exec_res.get("error"):
+        st.error("⚠️ El codigo fallo al ejecutarse (incluso despues de reintento):")
+        st.code(exec_res["error"], language="text")
+        with st.expander("📜 Codigo generado por la IA", expanded=True):
+            st.code(code, language="python")
+            if exec_res.get("stdout"):
+                st.caption("**Salida del codigo:**")
+                st.code(exec_res["stdout"], language="text")
+        return
+
+    new_overlays = exec_res.get("overlays", []) or []
+    new_subs     = exec_res.get("sub_charts", []) or []
+    expl         = exec_res.get("explanation") or explanation
+
+    if not new_overlays and not new_subs:
+        st.info(expl or "El codigo se ejecuto pero no genero overlays ni sub-graficas.")
+        with st.expander("📜 Codigo generado por la IA", expanded=False):
+            st.code(code, language="python")
+        return
+
+    # Procesar overlays (incluyendo replace_by_label igual que en Ruta C)
+    added = replaced = 0
+    for ov in new_overlays:
+        if ov.get("action") == "replace_by_label":
+            lbl = ov.get("label", "").lower()
+            match_idx = None
+            for i, existing in enumerate(state["overlays"]):
+                if existing.get("label", "").lower() == lbl:
+                    match_idx = i; break
+            if match_idx is None:
+                for i, existing in enumerate(state["overlays"]):
+                    elbl = existing.get("label", "").lower()
+                    if lbl and (lbl in elbl or elbl in lbl):
+                        match_idx = i; break
+            if match_idx is None and state["overlays"]:
+                match_idx = len(state["overlays"]) - 1
+            if match_idx is not None:
+                state["overlays"][match_idx].update(
+                    {k: v for k, v in ov.items() if k != "action"}
+                )
+                replaced += 1
+        else:
+            state["overlays"].append(ov)
+            added += 1
+
+    if new_subs:
+        state["sub_charts"] = state.get("sub_charts", []) + new_subs
+    state["last_explanation"] = expl
+
+    parts = []
+    if added:    parts.append(f"{added} overlay(s) nuevo(s)")
+    if replaced: parts.append(f"{replaced} overlay(s) modificado(s)")
+    if new_subs: parts.append(f"{len(new_subs)} sub-grafica(s)")
+
+    # Persistir resumen + codigo para que el fragment los muestre despues del rerun
+    state["_last_ai_code"] = {
+        "summary": f"✓ @code aplicado: {', '.join(parts)}. {expl}",
+        "code":    code,
+        "stdout":  exec_res.get("stdout", ""),
+    }
+
+    # scope=fragment: solo recarga el bloque del chart, mantiene posicion de scroll
+    st.rerun(scope="fragment")
+
+
 def _render_modify_panel(state: dict, state_key: str, df, context):
-    st.caption("Ejemplos: _\"Dibuja limites a 2 sigma\"_, _\"Agrega media movil de 10 puntos\"_, "
-               "_\"Predice el comportamiento 5 dias hacia adelante\"_, _\"Muestra prediccion segun el historial\"_.")
+    prompt_key  = f"{state_key}_prompt_val"
+    submit_key  = f"{state_key}_apply_btn"
 
-    # st.form: Enter en el campo de texto = clic en Aplicar automaticamente
-    with st.form(key=f"{state_key}_mod_form", clear_on_submit=True):
-        prompt = st.text_input(
-            "Describe que quieres hacer",
-            placeholder="Ej: Predice el comportamiento en los proximos 5 dias segun los datos",
-            label_visibility="collapsed",
+    # Pre-llenar si viene de click directo en sugerencia (ejecucion inmediata)
+    if "_pending_prompt" in state:
+        st.session_state[prompt_key] = state.pop("_pending_prompt")
+
+    def _on_change():
+        pass  # solo para registrar cambios; la logica de show_cmds la maneja JS
+
+    prompt = st.text_input(
+        "IA",
+        key=prompt_key,
+        on_change=_on_change,
+        placeholder="Escribe @ para ver comandos, o describe lo que quieres (Enter para aplicar)",
+        label_visibility="collapsed",
+    )
+
+    # Boton "Aplicar" invisible (JS lo hace clic al presionar Enter)
+    go = st.button(
+        "🚀 Aplicar",
+        key=submit_key,
+        type="primary",
+        use_container_width=True,
+    )
+
+    # Inyectar el autocomplete JS (se adjunta al input de arriba)
+    _inject_autocomplete_js(prompt_key, submit_key)
+
+    if not (go and prompt.strip()):
+        return
+
+    # Limpiar input
+    if prompt_key in st.session_state:
+        del st.session_state[prompt_key]
+
+    summary = _build_summary(df, context)
+    p_lower  = prompt.lower()
+
+    # ---- Ruta @code (MAXIMA PRIORIDAD): libertad total a la IA, codigo Python ----
+    p_stripped = prompt.strip()
+    if p_stripped.lower().startswith("@code"):
+        instructions = p_stripped[5:].strip()
+        if not instructions:
+            st.warning("Escribe instrucciones despues de @code. Ej: `@code detecta anomalias con Isolation Forest`")
+            return
+        _run_code_free_mode(instructions, state, state_key, df, context, summary)
+        return
+
+    # ---- Ruta @ (comandos analiticos predefinidos) ----
+    analysis_result = _dispatch_analysis_command(prompt, df, context)
+    if analysis_result:
+        if "error" in analysis_result:
+            st.error(analysis_result["error"])
+            if not _HAS_STATSMODELS and "statsmodels" in analysis_result.get("error", ""):
+                st.code("pip install statsmodels", language="bash")
+            return
+        new_overlays = analysis_result.get("overlays", [])
+        new_sub      = analysis_result.get("sub_charts", [])
+        explanation  = analysis_result.get("explanation", "")
+        if new_overlays:
+            state["overlays"].extend(new_overlays)
+        if new_sub:
+            state["sub_charts"] = state.get("sub_charts", []) + new_sub
+        state["last_explanation"] = explanation
+        if explanation:
+            st.success("✓ Análisis completado.")
+            with st.expander("📊 Detalle", expanded=False):
+                st.markdown(explanation)
+        st.rerun()
+        return
+
+    has_ts_data = (
+        df is not None and not df.empty
+        and "Value_Num" in df.columns
+        and "TimeStamp" in df.columns
+    )
+
+    # ---- Ruta A: Prediccion compleja con LLM (elige modelo) ----
+    is_complex_predict = has_ts_data and (
+        any(w in p_lower for w in _COMPLEX_PREDICT_WORDS)
+        or (any(w in p_lower for w in _SIMPLE_PREDICT_WORDS) and len(df) >= 20)
+    )
+    if is_complex_predict:
+        with st.spinner("🧠 Analizando patron de datos y calculando modelo predictivo..."):
+            overlays, explanation, reasoning = _llm_guided_forecast(prompt, df, context, summary)
+        if overlays:
+            state["overlays"].extend(overlays)
+            state["last_explanation"] = explanation
+            st.success("✓ Modelo predictivo aplicado.")
+            with st.expander("📊 Detalle del modelo", expanded=False):
+                st.markdown(f"**{explanation}**")
+                if reasoning:
+                    st.markdown(f"*{reasoning}*")
+        else:
+            st.warning("No se pudo calcular el modelo. La grafica necesita datos numericos con timestamps.")
+        st.rerun()
+        return
+
+    # ---- Ruta B: Fallback local (rapido, sin LLM) ----
+    local = _local_overlay_fallback(prompt, summary, df)
+    if local:
+        state["overlays"].extend(local)
+        state["last_explanation"] = f"{len(local)} capa(s) de control aplicada(s)."
+        st.success(f"✓ {len(local)} modificacion(es) aplicada(s).")
+        st.rerun()
+        return
+
+    # ---- Ruta C: LLM libre con acceso total (overlays declarativos O codigo Python) ----
+    # Incluir overlays actuales (sin el array 'data' masivo) para que la IA pueda modificarlos
+    current_overlays_summary = [
+        {k: v for k, v in ov.items() if k != "data"}
+        for ov in state.get("overlays", [])
+    ]
+    # Extraer spec Vega de la grafica para que la IA "vea" su codigo
+    chart_spec: dict = {}
+    try:
+        store = st.session_state.get(f"{state_key[len('chartai_'):]}") if False else None
+        # Recuperamos el chart desde el store usando el state_key
+        _sk = state_key.replace("chartai_", "")
+        _store = st.session_state.get(f"chartai_{_sk}_store", {})
+        _c = _store.get("chart")
+        if _c is not None and hasattr(_c, "to_dict"):
+            full_spec = _c.to_dict()
+            # Reducir: quitar datasets grandes inline
+            chart_spec = {
+                "mark": full_spec.get("mark"),
+                "encoding": full_spec.get("encoding"),
+                "transform": full_spec.get("transform"),
+                "config": {k: v for k, v in (full_spec.get("config") or {}).items() if k in ("view","axis","title")},
+                "width": full_spec.get("width"),
+                "height": full_spec.get("height"),
+            }
+    except Exception:
+        chart_spec = {}
+
+    user_msg = (
+        f"Peticion del usuario: {prompt}\n\n"
+        f"Datos de la grafica (resumen):\n{json.dumps(summary, ensure_ascii=False, indent=2)}"
+        + (
+            f"\n\nOverlays actualmente visibles:\n"
+            f"{json.dumps(current_overlays_summary, ensure_ascii=False, indent=2)}"
+            if current_overlays_summary else ""
         )
-        go = st.form_submit_button("🚀 Aplicar", type="primary", use_container_width=False)
-
-    if go and prompt.strip():
-        summary = _build_summary(df, context)
-        p_lower = prompt.lower()
-
-        has_ts_data = (
-            df is not None and not df.empty
-            and "Value_Num" in df.columns
-            and "TimeStamp" in df.columns
+        + (
+            f"\n\nSpec Vega-Lite de la grafica actual:\n"
+            f"{json.dumps(chart_spec, ensure_ascii=False, indent=2, default=str)[:2000]}"
+            if chart_spec else ""
         )
+    )
+    try:
+        with st.spinner("🧠 La IA esta analizando la grafica y tus datos..."):
+            result = chat_completion_json(_CODE_SYSTEM, user_msg, temperature=0.1)
 
-        # ---- Ruta A: Prediccion compleja con LLM (elige modelo) ----
-        is_complex_predict = has_ts_data and (
-            any(w in p_lower for w in _COMPLEX_PREDICT_WORDS)
-            or (any(w in p_lower for w in _SIMPLE_PREDICT_WORDS) and len(df) >= 20)
-        )
+        if "error" in result:
+            st.error("⚠️ No pude interpretar la respuesta del modelo.")
+            with st.expander("Ver respuesta cruda del modelo (debug)"):
+                st.code(result.get("raw", ""), language="text")
+            st.info("💡 Escribe @ para ver comandos analiticos predefinidos.")
+            return
 
-        if is_complex_predict:
-            with st.spinner("🧠 Analizando patron de datos y calculando modelo predictivo..."):
-                overlays, explanation, reasoning = _llm_guided_forecast(prompt, df, context, summary)
-            if overlays:
-                state["overlays"].extend(overlays)
-                state["last_explanation"] = explanation
-                st.success(f"\u2713 Modelo predictivo aplicado.")
-                with st.expander("📊 Detalle del modelo", expanded=False):
-                    st.markdown(f"**{explanation}**")
-                    if reasoning:
-                        st.markdown(f"*{reasoning}*")
-            else:
-                st.warning("No se pudo calcular el modelo. La grafica necesita datos numericos con timestamps.")
+        mode        = (result.get("mode") or "overlay").lower()
+        explanation = result.get("explanation", "")
+
+        # ---- Modo CODE: ejecutar Python generado por la IA ----
+        if mode == "code" and result.get("python_code"):
+            code = result["python_code"]
+            with st.spinner("⚙️ Ejecutando analisis..."):
+                exec_res = _execute_llm_code(code, df, chart_spec)
+
+            if exec_res.get("error"):
+                st.error("⚠️ El codigo generado fallo al ejecutarse.")
+                with st.expander("Ver error y codigo (debug)"):
+                    st.code(exec_res["error"], language="text")
+                    st.code(code, language="python")
+                return
+
+            new_overlays = exec_res.get("overlays", []) or []
+            new_subs     = exec_res.get("sub_charts", []) or []
+            expl_code    = exec_res.get("explanation") or explanation
+
+            if not new_overlays and not new_subs:
+                st.warning(expl_code or "El codigo se ejecuto pero no produjo resultados.")
+                if exec_res.get("stdout"):
+                    with st.expander("Salida del codigo"):
+                        st.code(exec_res["stdout"], language="text")
+                return
+
+            if new_overlays:
+                state["overlays"].extend(new_overlays)
+            if new_subs:
+                state["sub_charts"] = state.get("sub_charts", []) + new_subs
+            state["last_explanation"] = expl_code
+            msg_parts = []
+            if new_overlays: msg_parts.append(f"{len(new_overlays)} overlay(s)")
+            if new_subs:     msg_parts.append(f"{len(new_subs)} sub-grafica(s)")
+            st.success(f"✓ IA ejecuto codigo: {', '.join(msg_parts)}. {expl_code}")
+            with st.expander("📜 Ver codigo generado por la IA", expanded=False):
+                st.code(code, language="python")
             st.rerun()
             return
 
-        # ---- Ruta B: Fallback local (rapido, sin LLM) para patrones simples ----
-        local = _local_overlay_fallback(prompt, summary, df)
-        if local:
-            state["overlays"].extend(local)
-            state["last_explanation"] = f"{len(local)} capa(s) de control aplicada(s)."
-            st.success(f"✓ {len(local)} modificacion(es) aplicada(s).")
-            st.rerun()   # full-page: garantiza que la grafica se re-renderice con el overlay
+        # ---- Modo OVERLAY: JSON declarativo (rapido, cambios simples) ----
+        new_overlays = result.get("overlays", []) or []
+        if not new_overlays:
+            st.warning(explanation or "La IA no propuso modificaciones.")
             return
 
-        # ---- Ruta C: LLM libre para overlays visuales ----
-        user_msg = (
-            f"Peticion del usuario: {prompt}\n\n"
-            f"Datos de la grafica (resumen):\n{json.dumps(summary, ensure_ascii=False, indent=2)}"
-        )
-        try:
-            with st.spinner("La IA esta pensando..."):
-                result = chat_completion_json(_OVERLAY_SYSTEM, user_msg, temperature=0.1)
-
-            if "error" in result:
-                st.error("⚠️ No pude interpretar la respuesta del modelo.")
-                with st.expander("Ver respuesta cruda del modelo (debug)"):
-                    st.code(result.get("raw", ""), language="text")
-                st.info("💡 Reformula con palabras clave: *sigma*, *banda*, *limite*, *promedio*, *maximo*, *minimo*, *tendencia*.")
+        added = 0
+        replaced = 0
+        for ov in new_overlays:
+            if ov.get("action") == "replace_by_label":
+                lbl = ov.get("label", "").lower()
+                match_idx = None
+                for i, existing in enumerate(state["overlays"]):
+                    if existing.get("label", "").lower() == lbl:
+                        match_idx = i; break
+                if match_idx is None:
+                    for i, existing in enumerate(state["overlays"]):
+                        elbl = existing.get("label", "").lower()
+                        if lbl and (lbl in elbl or elbl in lbl):
+                            match_idx = i; break
+                if match_idx is None and state["overlays"]:
+                    match_idx = len(state["overlays"]) - 1
+                if match_idx is not None:
+                    state["overlays"][match_idx].update(
+                        {k: v for k, v in ov.items() if k != "action"}
+                    )
+                    replaced += 1
             else:
-                new_overlays = result.get("overlays", []) or []
-                explanation  = result.get("explanation", "")
-                if not new_overlays:
-                    st.warning(explanation or "La IA no propuso modificaciones.")
-                else:
-                    state["overlays"].extend(new_overlays)
-                    state["last_explanation"] = explanation
-                    st.success(f"✓ {len(new_overlays)} modificacion(es) aplicada(s). {explanation}")
-                    st.rerun()   # full-page: garantiza re-render del chart con overlay
-        except Exception as e:
-            st.error(f"Error: {e}")
+                state["overlays"].append(ov)
+                added += 1
+        state["last_explanation"] = explanation
+        parts = []
+        if replaced: parts.append(f"{replaced} overlay(s) modificado(s)")
+        if added:    parts.append(f"{added} overlay(s) agregado(s)")
+        st.success(f"✓ {', '.join(parts) or 'cambios aplicados'}. {explanation}")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Error: {e}")
 
 
 def _render_qa_panel(state: dict, state_key: str, df, context):
