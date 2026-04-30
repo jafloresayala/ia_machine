@@ -12,7 +12,7 @@ from config import OLLAMA_MODEL
 
 # Vistas
 from views import (
-    home, agent, explorer, monitor, analytics, compare, insights, knowledge,
+    home, agent, explorer, monitor, analytics, compare, knowledge,
     settings as settings_view,
 )
 
@@ -104,7 +104,6 @@ VIEWS = {
     "monitor":   monitor.render,
     "analytics": analytics.render,
     "compare":   compare.render,
-    "insights":  insights.render,
     "knowledge": knowledge.render,
     "settings":  settings_view.render,
 }
@@ -113,11 +112,23 @@ VIEWS = {
 def main():
     render_sidebar()
     view_fn = VIEWS.get(st.session_state.nav, home.render)
-    try:
-        view_fn()
-    except Exception as e:
-        st.error(f"Error en la vista: {e}")
-        st.exception(e)
+    view_labels = {
+        "home":      "Cargando inicio…",
+        "agent":     "Iniciando terminal…",
+        "explorer":  "Cargando explorador de maquinas…",
+        "monitor":   "Cargando Live Monitor…",
+        "analytics": "Cargando Analytics Lab…",
+        "compare":   "Cargando comparativa…",
+        "knowledge": "Cargando base de conocimiento…",
+        "settings":  "Cargando configuración…",
+    }
+    label = view_labels.get(st.session_state.nav, "Cargando…")
+    with st.spinner(label):
+        try:
+            view_fn()
+        except Exception as e:
+            st.error(f"Error en la vista: {e}")
+            st.exception(e)
 
 
 if __name__ == "__main__":

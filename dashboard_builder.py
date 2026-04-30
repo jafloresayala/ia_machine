@@ -8,12 +8,23 @@ import numpy as np
 import altair as alt
 from datetime import datetime
 
-from chart_ai import chart_with_ai
 
 
 # ----------------------------------------------------------
 # Detección de tipo de datos
 # ----------------------------------------------------------
+_MAX_CHART_POINTS = 800  # umbral de downsampling para gráficas
+
+
+def _downsample(df: pd.DataFrame, max_pts: int = _MAX_CHART_POINTS) -> pd.DataFrame:
+    """LTTB-like: si hay más puntos que max_pts, submuestrea uniformemente preservando extremos."""
+    if len(df) <= max_pts:
+        return df
+    # Siempre incluir primero y último, distribuir el resto uniformemente
+    idx = np.round(np.linspace(0, len(df) - 1, max_pts)).astype(int)
+    return df.iloc[idx].reset_index(drop=True)
+
+
 def infer_tag_mode(df: pd.DataFrame) -> str:
     if df.empty:
         return "unknown"
@@ -452,12 +463,11 @@ def render_machine_dashboard(
                 mc[4].metric("Promedio", _safe_metric(valid.mean() if not valid.empty else None))
 
                 if show_outliers:
-                    # Gráfico con límites de desviación estándar
-                    outlier_chart, stats = _numeric_outlier_chart(df, tag_name)
+                    outlier_chart, stats = _numeric_outlier_chart(
+                        _downsample(df.dropna(subset=["TimeStamp", "Value_Num"])), tag_name
+                    )
                     if outlier_chart is not None:
-                        chart_with_ai(outlier_chart, df=df, chart_id=f"outlier_{tag_name}",
-                                      context={"tag": tag_name, "type": "outlier_chart"})
-                        # Métricas de outliers
+                        st.altair_chart(outlier_chart, use_container_width=True)
                         oc = st.columns(4)
                         oc[0].metric("σ (Std Dev)", _safe_metric(stats.get("std")))
                         oc[1].metric("Upper Limit", _safe_metric(stats.get("upper")))
@@ -466,15 +476,14 @@ def render_machine_dashboard(
                     else:
                         st.info("Sin datos suficientes para análisis de outliers.")
                 else:
-                    chart = _numeric_chart(df.dropna(subset=["TimeStamp", "Value_Num"]), tag_name)
-                    chart_with_ai(chart, df=df, chart_id=f"numeric_{tag_name}",
-                                  context={"tag": tag_name, "type": "numeric_timeseries"})
+                    plot_df = _downsample(df.dropna(subset=["TimeStamp", "Value_Num"]))
+                    chart = _numeric_chart(plot_df, tag_name)
+                    st.altair_chart(chart, use_container_width=True)
 
                 if show_histogram:
                     hist = _histogram_chart(df, tag_name)
                     if hist is not None:
-                        chart_with_ai(hist, df=df, chart_id=f"hist_{tag_name}",
-                                      context={"tag": tag_name, "type": "histogram"})
+                        st.altair_chart(hist, use_container_width=True)
 
     # --- Sección categórica ---
     if categorical_items:
@@ -538,8 +547,7 @@ def render_machine_dashboard(
                 # Pasar el DF completo — _smart_categorical_chart resuelve la columna internamente
                 chart = _smart_categorical_chart(df, tag_name, mode)
                 if chart is not None:
-                    chart_with_ai(chart, df=df, chart_id=f"cat_{tag_name}",
-                                  context={"tag": tag_name, "type": "categorical", "mode": mode})
+                    st.altair_chart(chart, use_container_width=True)
                 elif val_series is not None and not val_series.empty:
                     # Fallback: tabla de frecuencias
                     freq = val_series.value_counts().reset_index()
@@ -576,9 +584,8 @@ def render_attribute_detail(
         cols[4].metric("Promedio", _safe_metric(valid.mean() if not valid.empty else None))
         cols[5].metric("Desv. Std", _safe_metric(valid.std() if not valid.empty else None))
 
-        chart = _numeric_chart(df.dropna(subset=["TimeStamp", "Value_Num"]), tag_name)
-        chart_with_ai(chart, df=df, chart_id=f"detail_num_{tag_name}",
-                      context={"tag": tag_name, "type": "numeric_detail"})
+        chart = _numeric_chart(_downsample(df.dropna(subset=["TimeStamp", "Value_Num"])), tag_name)
+        st.altair_chart(chart, use_container_width=True)
 
         # Histograma
         if not valid.empty:
@@ -591,8 +598,7 @@ def render_attribute_detail(
                 )
                 .properties(height=250, title="Distribución")
             )
-            chart_with_ai(hist, df=df, chart_id=f"detail_hist_{tag_name}",
-                          context={"tag": tag_name, "type": "histogram"})
+            st.altair_chart(hist, use_container_width=True)
 
     else:
         current = df["Value_Str"].dropna().iloc[-1] if df["Value_Str"].notna().any() else "N/A"
@@ -602,8 +608,7 @@ def render_attribute_detail(
         cols[2].metric("Estados únicos", df["Value_Str"].nunique(dropna=True))
 
         chart = _categorical_chart(df.dropna(subset=["TimeStamp", "Value_Str"]), tag_name)
-        chart_with_ai(chart, df=df, chart_id=f"detail_cat_{tag_name}",
-                      context={"tag": tag_name, "type": "categorical_detail"})
+        st.altair_chart(chart, use_container_width=True)
 
     # Tabla de datos
     with st.expander("📋 Ver datos crudos"):

@@ -11,9 +11,12 @@ NAV_ITEMS = [
     ("agent",      "🤖 Agent",           "AI"),
     ("explorer",   "🗂️ Explorer",         "Data"),
     ("monitor",    "📡 Live Monitor",    "Data"),
-    ("analytics",  "🔬 Analytics Lab",   "Intelligence"),
+    ("analytics",  "🎮 Playground",       "Intelligence"),
     ("compare",    "⚖️ Compare",          "Intelligence"),
-    ("insights",   "💡 AI Insights",     "Intelligence"),
+]
+
+# Hidden views (accessible programmatically but not shown in sidebar)
+_HIDDEN_ITEMS = [
     ("knowledge",  "📚 Knowledge",       "Library"),
     ("settings",   "⚙️ Settings",         "Config"),
 ]
@@ -46,6 +49,7 @@ def init_state():
 
         # Compare
         "compare_machines":   [],
+        "compare_window":     "last_hour",
 
         # Analytics
         "analytics_machine":  None,

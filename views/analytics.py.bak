@@ -1,4 +1,4 @@
-"""Playground - analisis avanzado: outliers, correlacion, distribuciones, anomalias.
+﻿"""Playground - analisis avanzado: outliers, correlacion, distribuciones, anomalias.
 
 Lazy loading por pestana: los metadatos de tags se cargan sin limite al inicio,
 pero los datos reales solo se descargan cuando el usuario selecciona parametros.
@@ -27,12 +27,12 @@ def _pick_time_range() -> tuple[datetime, datetime, str]:
     """
     mode = st.radio(
         "Modo de tiempo",
-        ["⏱ Ventana rapida", "📅 Rango exacto"],
+        ["â± Ventana rapida", "ðŸ“… Rango exacto"],
         horizontal=True,
         label_visibility="collapsed",
     )
 
-    if mode == "⏱ Ventana rapida":
+    if mode == "â± Ventana rapida":
         window_min = st.select_slider(
             "Ventana",
             options=[5, 10, 15, 30, 60, 120, 240, 480, 1440],
@@ -54,9 +54,9 @@ def _pick_time_range() -> tuple[datetime, datetime, str]:
         </div>""", unsafe_allow_html=True)
         fc1, fc2, fc3 = st.columns([3, 3, 1])
         with fc1:
-            from_date = st.date_input("📅 Fecha", value=default_from.date(), key="lab_from_date")
+            from_date = st.date_input("ðŸ“… Fecha", value=default_from.date(), key="lab_from_date")
         with fc2:
-            from_time = st.time_input("🕐 Hora : Min", value=time(default_from.hour, default_from.minute, 0), key="lab_from_time", step=60)
+            from_time = st.time_input("ðŸ• Hora : Min", value=time(default_from.hour, default_from.minute, 0), key="lab_from_time", step=60)
         with fc3:
             from_sec = st.number_input("Seg", min_value=0, max_value=59, value=0, key="lab_from_sec")
 
@@ -67,9 +67,9 @@ def _pick_time_range() -> tuple[datetime, datetime, str]:
         </div>""", unsafe_allow_html=True)
         tc1, tc2, tc3 = st.columns([3, 3, 1])
         with tc1:
-            to_date = st.date_input("📅 Fecha", value=now.date(), key="lab_to_date")
+            to_date = st.date_input("ðŸ“… Fecha", value=now.date(), key="lab_to_date")
         with tc2:
-            to_time = st.time_input("🕐 Hora : Min", value=time(now.hour, now.minute, 0), key="lab_to_time", step=60)
+            to_time = st.time_input("ðŸ• Hora : Min", value=time(now.hour, now.minute, 0), key="lab_to_time", step=60)
         with tc3:
             to_sec = st.number_input("Seg", min_value=0, max_value=59, value=0, key="lab_to_sec")
 
@@ -77,7 +77,7 @@ def _pick_time_range() -> tuple[datetime, datetime, str]:
         to_dt   = datetime.combine(to_date,   to_time).replace(second=to_sec)
 
         if from_dt >= to_dt:
-            st.error("⚠️ La fecha de inicio debe ser anterior a la fecha fin.")
+            st.error("âš ï¸ La fecha de inicio debe ser anterior a la fecha fin.")
             st.stop()
 
         delta = to_dt - from_dt
@@ -89,13 +89,13 @@ def _pick_time_range() -> tuple[datetime, datetime, str]:
             f"<div style='margin-top:0.5rem;padding:0.45rem 0.75rem;border-radius:8px;"
             f"background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.2);"
             f"font-size:0.82rem;color:#6366f1;'>"
-            f"⏱ <b>{from_dt.strftime('%d/%m/%Y %H:%M:%S')}</b>"
-            f" &nbsp;→&nbsp; "
+            f"â± <b>{from_dt.strftime('%d/%m/%Y %H:%M:%S')}</b>"
+            f" &nbsp;â†’&nbsp; "
             f"<b>{to_dt.strftime('%d/%m/%Y %H:%M:%S')}</b>"
-            f" &nbsp;·&nbsp; {duration_str}</div>",
+            f" &nbsp;Â·&nbsp; {duration_str}</div>",
             unsafe_allow_html=True,
         )
-        label = f"{from_dt.strftime('%d/%m %H:%M:%S')} → {to_dt.strftime('%d/%m %H:%M:%S')} ({duration_str})"
+        label = f"{from_dt.strftime('%d/%m %H:%M:%S')} â†’ {to_dt.strftime('%d/%m %H:%M:%S')} ({duration_str})"
 
     return from_dt, to_dt, label
 
@@ -104,12 +104,12 @@ def _pick_time_range() -> tuple[datetime, datetime, str]:
 # Tipos de parametro: normalizacion y colores (emoji)
 # ----------------------------------------------------------------
 _TYPE_EMOJI = {
-    "float":    "🟢",
-    "int":      "🔵",
-    "bool":     "🟡",
-    "string":   "🟠",
-    "datetime": "🟣",
-    "unknown":  "⚫",
+    "float":    "ðŸŸ¢",
+    "int":      "ðŸ”µ",
+    "bool":     "ðŸŸ¡",
+    "string":   "ðŸŸ ",
+    "datetime": "ðŸŸ£",
+    "unknown":  "âš«",
 }
 
 def _normalize_type(raw) -> str:
@@ -151,23 +151,16 @@ def _get_all_tags(machine_path: str):
 # Helper: fetch datos para los tags seleccionados
 # ----------------------------------------------------------------
 def _fetch_selected(tag_names: list, from_dt, to_dt) -> dict:
-    """Retorna tag_data: {full_tag: DataFrame} solo para los tags dados.
-
-    Fetches each tag individually to avoid PI API batch-size limitations
-    that can silently drop or corrupt values for some tags in a multi-tag request.
-    """
+    """Retorna tag_data: {full_tag: DataFrame} solo para los tags dados."""
     if not tag_names:
         return {}
-
+    with st.spinner(f"Cargando datos de {len(tag_names)} parametros..."):
+        raw = fetch_tag_values(tag_names, from_dt, to_dt)
     td = {}
-    progress = st.empty()
-    for i, tn in enumerate(tag_names):
-        progress.caption(f"Cargando parametro {i + 1}/{len(tag_names)}: {tn.split('.')[-1]}…")
-        raw = fetch_tag_values([tn], from_dt, to_dt)
+    for tn in tag_names:
         sub = raw[raw["Tag_Name"] == tn].copy()
         if not sub.empty:
             td[tn] = sub
-    progress.empty()
     return td
 
 
@@ -176,7 +169,7 @@ def _fetch_selected(tag_names: list, from_dt, to_dt) -> dict:
 # ----------------------------------------------------------------
 def render():
     page_header(
-        eyebrow="Intelligence · Playground",
+        eyebrow="Intelligence Â· Playground",
         title="Playground",
         subtitle="Explora outliers, correlaciones, distribuciones y anomalias de cualquier maquina.",
     )
@@ -186,12 +179,12 @@ def render():
         st.warning("No hay maquinas disponibles.")
         return
 
-    # ── Two-column layout: config (left) | analysis (right) ──
+    # â”€â”€ Two-column layout: config (left) | analysis (right) â”€â”€
     col_cfg, col_main = st.columns([1, 2.6], gap="medium")
 
-    # ════════════════════════════════════════════════════════
-    # LEFT — configuración
-    # ════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # LEFT â€” configuraciÃ³n
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     with col_cfg:
         st.markdown(
             "<div style='background:linear-gradient(135deg,#4f46e5,#7c3aed);"
@@ -202,23 +195,10 @@ def render():
             "</div>",
             unsafe_allow_html=True,
         )
-        options_list = (df["machine_name"] + "  ·  " + df["line_name"]).tolist()
-        # Respect machine pre-selected from Explorer (Playground button)
-        preset_machine = st.session_state.get("analytics_machine", None)
-        default_idx = 0
-        if preset_machine:
-            for idx, opt in enumerate(options_list):
-                if opt.startswith(preset_machine + "  ·  ") or opt.split("  ·  ")[0] == preset_machine:
-                    default_idx = idx
-                    break
-        # Reset param selection when machine changes
-        prev_machine = st.session_state.get("analytics_machine", None)
-        sel = st.selectbox("Maquina", options=options_list, index=default_idx, label_visibility="collapsed")
+        options_list = (df["machine_name"] + "  Â·  " + df["line_name"]).tolist()
+        sel = st.selectbox("Maquina", options=options_list, index=0, label_visibility="collapsed")
         row = df.iloc[options_list.index(sel)]
-        if prev_machine != row["machine_name"]:
-            st.session_state.analytics_machine = row["machine_name"]
-            st.session_state.playground_params = []
-            st.rerun()
+        st.session_state.analytics_machine = row["machine_name"]
 
         # Tag metadata
         all_tags, short_map, type_map = _get_all_tags(row["machine_path"])
@@ -232,7 +212,7 @@ def render():
         type_counts = Counter(type_map.values())
         tc_cols = st.columns(2)
         for i, (typ, emoji) in enumerate(
-            [(t, _TYPE_EMOJI.get(t, "⚫")) for t in ["float", "int", "bool", "string"] if t in type_counts]
+            [(t, _TYPE_EMOJI.get(t, "âš«")) for t in ["float", "int", "bool", "string"] if t in type_counts]
         ):
             tc_cols[i % 2].markdown(
                 f"<div style='background:#f1f5f9;border-radius:8px;padding:6px 10px;margin-bottom:6px;"
@@ -260,49 +240,15 @@ def render():
             "border-radius:12px;padding:12px 16px;margin-bottom:14px;'>"
             "<div style='color:#fff;font-size:0.72rem;font-weight:700;letter-spacing:.1em;"
             "text-transform:uppercase;opacity:.8;'>Paso 3</div>"
-            "<div style='color:#fff;font-size:1rem;font-weight:700;'>Parametros</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-        def fmt_tag_cfg(t):
-            short = short_map.get(t, t)
-            typ   = type_map.get(t, "unknown")
-            emoji = _TYPE_EMOJI.get(typ, "⚫")
-            return f"{emoji} {short}  [{typ}]"
-
-        if "playground_params" not in st.session_state:
-            st.session_state.playground_params = []
-
-        st.multiselect(
-            "Parametros",
-            options=all_tags,
-            key="playground_params",
-            format_func=fmt_tag_cfg,
-            placeholder="Elige los parametros a analizar…",
-            label_visibility="collapsed",
-        )
-        if st.session_state.playground_params:
-            st.caption(f"📌 {len(st.session_state.playground_params)} seleccionados — compartidos entre todos los analisis")
-        else:
-            st.caption("Sin parametros seleccionados aun.")
-
-        st.divider()
-
-        st.markdown(
-            "<div style='background:linear-gradient(135deg,#f59e0b,#d97706);"
-            "border-radius:12px;padding:12px 16px;margin-bottom:14px;'>"
-            "<div style='color:#fff;font-size:0.72rem;font-weight:700;letter-spacing:.1em;"
-            "text-transform:uppercase;opacity:.8;'>Paso 4</div>"
             "<div style='color:#fff;font-size:1rem;font-weight:700;'>Tipo de analisis</div>"
             "</div>",
             unsafe_allow_html=True,
         )
         SECTIONS = {
-            "outliers":       ("📈", "Outliers",       "Detecta valores fuera de rango con bandas sigma"),
-            "correlacion":    ("🔗", "Correlacion",    "Matriz de Pearson entre parametros"),
-            "distribuciones": ("📊", "Distribuciones", "Histogramas y estadisticas por parametro"),
-            "anomalias":      ("🚨", "Anomalias",      "Puntos atipicos por z-score"),
+            "outliers":       ("ðŸ“ˆ", "Outliers",       "Detecta valores fuera de rango con bandas sigma"),
+            "correlacion":    ("ðŸ”—", "Correlacion",    "Matriz de Pearson entre parametros"),
+            "distribuciones": ("ðŸ“Š", "Distribuciones", "Histogramas y estadisticas por parametro"),
+            "anomalias":      ("ðŸš¨", "Anomalias",      "Puntos atipicos por z-score"),
         }
         if "playground_section" not in st.session_state:
             st.session_state.playground_section = "outliers"
@@ -327,9 +273,9 @@ def render():
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
-    # ════════════════════════════════════════════════════════
-    # RIGHT — análisis
-    # ════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # RIGHT â€” anÃ¡lisis
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     with col_main:
         section = st.session_state.playground_section
         icon, label, desc = SECTIONS[section]
@@ -349,7 +295,7 @@ def render():
         def fmt_tag(t):
             short = short_map.get(t, t)
             typ   = type_map.get(t, "unknown")
-            emoji = _TYPE_EMOJI.get(typ, "⚫")
+            emoji = _TYPE_EMOJI.get(typ, "âš«")
             return f"{emoji} {short}  [{typ}]"
 
         # Leyenda de tipos (compacta)
@@ -357,40 +303,28 @@ def render():
             "  ".join(f"{e} {k}" for k, e in _TYPE_EMOJI.items() if k != "unknown" and k in type_counts)
         )
 
-        # Parametros compartidos
-        sel_params = st.session_state.get("playground_params", [])
-
-        if not sel_params:
-            st.markdown(
-                "<div style='display:flex;flex-direction:column;align-items:center;"
-                "justify-content:center;padding:60px 20px;"
-                "background:#f8fafc;border:2px dashed #cbd5e1;border-radius:16px;margin-top:10px;'>"
-                "<div style='font-size:3rem;margin-bottom:12px;'>🎛️</div>"
-                "<div style='font-size:1.05rem;font-weight:700;color:#0f172a;margin-bottom:6px;'>"
-                "Selecciona parametros</div>"
-                "<div style='font-size:0.83rem;color:#64748b;text-align:center;max-width:280px;'>"
-                "Elige los parametros en el Paso 3 del panel izquierdo. "
-                "Los mismos aplican para todos los analisis.</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-            return
-
-        # ── OUTLIERS ──────────────────────────────────────────
+        # â”€â”€ OUTLIERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if section == "outliers":
-            c_opt = st.columns([1])[0]
+            c_sel, c_opt = st.columns([3, 1])
+            with c_sel:
+                sel_outlier = st.multiselect(
+                    f"Parametros ({len(all_tags)} disponibles)",
+                    options=all_tags,
+                    default=all_tags[:min(3, len(all_tags))],
+                    format_func=fmt_tag,
+                    key="analytics_outlier_sel",
+                )
             with c_opt:
                 std_factor = st.slider("Sigma threshold", 1.0, 4.0, 2.0, 0.5, key="analytics_std")
 
-            sel_outlier = sel_params
             if not sel_outlier:
-                st.info("👆 Selecciona parametros en el Paso 3 del panel izquierdo.")
+                st.info("ðŸ‘† Selecciona al menos un parametro para ver outliers.")
             else:
                 td = _fetch_selected(sel_outlier, from_dt, to_dt)
                 numeric_td = {n: d for n, d in td.items() if infer_tag_mode(d) == "numeric"}
                 non_numeric = [n for n in td if n not in numeric_td]
                 if non_numeric:
-                    st.caption(f"⚠️ Omitidos (no numericos): " + ", ".join(fmt_tag(n) for n in non_numeric))
+                    st.caption(f"âš ï¸ Omitidos (no numericos): " + ", ".join(fmt_tag(n) for n in non_numeric))
                 if not numeric_td:
                     st.info("Ninguno de los parametros seleccionados tiene datos numericos.")
                 else:
@@ -425,11 +359,17 @@ def render():
                             mc[2].metric("Lower", f"{stats.get('lower', 0):.3f}")
                             mc[3].metric("Outliers", f"{stats.get('outlier_count', 0)} ({stats.get('outlier_pct', 0):.1f}%)")
 
-        # ── CORRELACION ───────────────────────────────────────
+        # â”€â”€ CORRELACION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         elif section == "correlacion":
-            sel_corr = sel_params
+            sel_corr = st.multiselect(
+                f"Parametros para correlacion ({len(all_tags)} disponibles â€” solo numericos)",
+                options=all_tags,
+                default=all_tags[:min(6, len(all_tags))],
+                format_func=fmt_tag,
+                key="analytics_corr_sel",
+            )
             if len(sel_corr) < 2:
-                st.info("👆 Selecciona al menos 2 parametros en el Paso 3 del panel izquierdo.")
+                st.info("ðŸ‘† Selecciona al menos 2 parametros.")
             else:
                 td = _fetch_selected(sel_corr, from_dt, to_dt)
                 numeric_td = {n: d for n, d in td.items() if infer_tag_mode(d) == "numeric"}
@@ -486,7 +426,7 @@ def render():
                                     "Parametro A": fmt_tag(names[i]),
                                     "Parametro B": fmt_tag(names[j]),
                                     "Pearson rho": round(r, 3),
-                                    "Fuerza": "🔴 Fuerte" if abs(r) > 0.7 else "🟡 Moderada" if abs(r) > 0.4 else "⚪ Debil",
+                                    "Fuerza": "ðŸ”´ Fuerte" if abs(r) > 0.7 else "ðŸŸ¡ Moderada" if abs(r) > 0.4 else "âšª Debil",
                                 })
                         if pairs:
                             pairs_df = (
@@ -496,17 +436,23 @@ def render():
                             st.markdown("##### Top pares correlacionados")
                             st.dataframe(pairs_df.head(20), use_container_width=True, hide_index=True)
 
-        # ── DISTRIBUCIONES ────────────────────────────────────
+        # â”€â”€ DISTRIBUCIONES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         elif section == "distribuciones":
-            sel_dist = sel_params
+            sel_dist = st.multiselect(
+                f"Parametros ({len(all_tags)} disponibles â€” solo numericos graficados)",
+                options=all_tags,
+                default=all_tags[:min(4, len(all_tags))],
+                format_func=fmt_tag,
+                key="analytics_dist_sel",
+            )
             if not sel_dist:
-                st.info("👆 Selecciona parametros en el Paso 3 del panel izquierdo.")
+                st.info("ðŸ‘† Selecciona al menos un parametro.")
             else:
                 td = _fetch_selected(sel_dist, from_dt, to_dt)
                 numeric_td = {n: d for n, d in td.items() if infer_tag_mode(d) == "numeric"}
                 non_numeric = [n for n in td if n not in numeric_td]
                 if non_numeric:
-                    st.caption(f"⚠️ Omitidos (no numericos): " + ", ".join(fmt_tag(n) for n in non_numeric))
+                    st.caption(f"âš ï¸ Omitidos (no numericos): " + ", ".join(fmt_tag(n) for n in non_numeric))
                 if not numeric_td:
                     st.info("Ninguno de los parametros seleccionados tiene datos numericos.")
                 else:
@@ -515,7 +461,7 @@ def render():
                     for i, (tn, df_t) in enumerate(list(numeric_td.items())[:4]):
                         s = numeric_summary(df_t)
                         if s and i < 4:
-                            mc[i].metric(short_map.get(tn, tn), f"μ {s['mean']:.2f}", f"σ {s['std']:.2f}")
+                            mc[i].metric(short_map.get(tn, tn), f"Î¼ {s['mean']:.2f}", f"Ïƒ {s['std']:.2f}")
                     st.divider()
                     g_cols = st.columns(2)
                     for i, (tn, df_t) in enumerate(numeric_td.items()):
@@ -536,15 +482,22 @@ def render():
                                     sm[2].metric("IQR",   f"{s['iqr']:.2f}")
                                     sm[3].metric("Rango",  f"{s['range']:.2f}")
 
-        # ── ANOMALIAS ─────────────────────────────────────────
+        # â”€â”€ ANOMALIAS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         elif section == "anomalias":
-            c_opt2 = st.columns([1])[0]
-            with c_opt2:
+            c_sel, c_opt = st.columns([3, 1])
+            with c_sel:
+                sel_anom = st.multiselect(
+                    f"Parametros ({len(all_tags)} disponibles â€” solo numericos)",
+                    options=all_tags,
+                    default=all_tags[:min(5, len(all_tags))],
+                    format_func=fmt_tag,
+                    key="analytics_anom_sel",
+                )
+            with c_opt:
                 z_th = st.slider("Z-score threshold", 1.5, 4.0, 2.5, 0.25, key="analytics_z")
 
-            sel_anom = sel_params
             if not sel_anom:
-                st.info("👆 Selecciona parametros en el Paso 3 del panel izquierdo.")
+                st.info("ðŸ‘† Selecciona al menos un parametro.")
             else:
                 td = _fetch_selected(sel_anom, from_dt, to_dt)
                 numeric_td = {n: d for n, d in td.items() if infer_tag_mode(d) == "numeric"}
@@ -562,7 +515,7 @@ def render():
                             "Total puntos": len(df_t),
                             "Anomalias": len(anom),
                             "% anomalo": f"{100*len(anom)/max(len(df_t),1):.1f}%",
-                            "Estado": "🔴 Revisar" if len(anom) > 0 else "🟢 Normal",
+                            "Estado": "ðŸ”´ Revisar" if len(anom) > 0 else "ðŸŸ¢ Normal",
                         })
 
                     # Summary table
@@ -595,6 +548,6 @@ def render():
                             st.dataframe(show.head(30), use_container_width=True, hide_index=True, height=240)
 
                     if not any_found:
-                        st.success("✅ No se detectaron anomalias significativas con el threshold actual.")
+                        st.success("âœ… No se detectaron anomalias significativas con el threshold actual.")
 
 

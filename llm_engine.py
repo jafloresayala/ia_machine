@@ -327,6 +327,43 @@ def chat_as_agent_stream(
     return chat_completion_stream(system, user_message, temperature=0.5)
 
 
+def terminal_chat_stream(
+    messages: list[dict],
+    system_prompt: str,
+    temperature: float | None = None,
+):
+    """
+    Streaming multi-turn: acepta una lista completa de mensajes {role, content}.
+    Compatible con st.write_stream().
+    """
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "stream": True,
+        "options": {
+            "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
+        },
+    }
+    try:
+        with requests.post(url, json=payload, timeout=LLM_TIMEOUT, stream=True) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk = data.get("message", {}).get("content", "")
+                if chunk:
+                    yield chunk
+                if data.get("done"):
+                    break
+    except Exception as exc:
+        yield f"\n[Error: {exc}]"
+
+
 def is_ollama_available() -> bool:
     try:
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)

@@ -1,497 +1,496 @@
-"""Vista Agent — interfaz conversacional con el agente de IA."""
-import io
-from datetime import datetime, date, time, timedelta
+﻿"""Agent — terminal inmersivo. Input nativo de Streamlit estilizado como terminal."""
+from datetime import datetime, timedelta
+import html as _html_module
 
-import pandas as pd
 import streamlit as st
 
-from theme import page_header, COLORS
-from config import QUERY_SUGGESTIONS, OLLAMA_MODEL
+from config import OLLAMA_MODEL
+from machine_registry import get_machine_names, smart_find_machine, get_machine_tags
 from api_client import fetch_tag_values
-from machine_registry import (
-    discover_machines, find_machine, smart_find_machine, get_machine_tags, get_machine_names,
-)
-from llm_engine import answer_user_question, chat_as_agent, chat_as_agent_stream, llm_pick_machine
-from intent_parser import parse_query, parse_query_fallback, resolve_time_range
-from dashboard_builder import (
-    render_machine_dashboard, render_machine_list, build_data_summary_text,
-)
+from analytics import numeric_summary, categorical_summary
+from dashboard_builder import infer_tag_mode
+from llm_engine import terminal_chat_stream
+
+# ─────────────────────────────────────────────────────────
+# Estados
+# ─────────────────────────────────────────────────────────
+STATE_IDLE      = "idle"
+STATE_FETCHING  = "fetching"
+STATE_THINKING  = "thinking"
+STATE_STREAMING = "streaming"
+STATE_ERROR     = "error"
+
+_STATE_META = {
+    STATE_IDLE:      {"dot": "#3fb950", "label": "idle",      "anim": False},
+    STATE_FETCHING:  {"dot": "#f0883e", "label": "fetching PI data", "anim": True},
+    STATE_THINKING:  {"dot": "#58a6ff", "label": "thinking",  "anim": True},
+    STATE_STREAMING: {"dot": "#58a6ff", "label": "streaming", "anim": True},
+    STATE_ERROR:     {"dot": "#f85149", "label": "error",     "anim": False},
+}
+
+_BASE_SYSTEM = """Eres el agente MIP (Machine Intelligence Platform) de Kimball Electronics Mexico.
+Experto en manufactura SMT: Paste Printer, SPI, Pick & Place, Reflow, AOI, ICT.
+
+Tienes acceso a datos en tiempo real de las maquinas de produccion de la planta via PI System.
+Cuando el usuario pregunte por datos de una maquina y se te incluyan datos en el contexto, analizalos y responde con precision.
+Cuando no haya datos de maquina en el contexto, responde con tu conocimiento de SMT.
+
+REGLAS:
+- Responde en el idioma del usuario (espanol por defecto).
+- Se directo y conciso. Evita relleno.
+- Usa formato markdown cuando ayude a la claridad.
+- Si el usuario pide un analisis, usa los datos del contexto no inventes valores.
+- Si no tienes datos suficientes para responder algo especifico, dilo claramente.
+"""
+
+# ─────────────────────────────────────────────────────────
+# CSS — terminal + override de st.chat_input
+# ─────────────────────────────────────────────────────────
+_TERM_CSS = """
+<style>
+/* ── Keyframes ── */
+@keyframes xterm-blink { 0%,100%{opacity:1} 50%{opacity:0} }
+@keyframes xterm-ellipsis {
+    0%   { content: ".";   }
+    33%  { content: "..";  }
+    66%  { content: "..."; }
+    100% { content: "";    }
+}
+@keyframes xterm-spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* ── Shell container (history only, no bottom radius when chat_input is below) ── */
+.xterm-shell {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-bottom: 1px solid #21262d;
+    border-radius: 12px 12px 0 0;
+    font-family: 'Consolas','JetBrains Mono','Courier New',monospace;
+    font-size: 0.855rem;
+    line-height: 1.7;
+    color: #c9d1d9;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+}
+
+/* ── Title bar ── */
+.xterm-titlebar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: #161b22;
+    border-bottom: 1px solid #21262d;
+    user-select: none;
+}
+.xterm-btn { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.xterm-btn-r { background: #f85149; }
+.xterm-btn-y { background: #d29922; }
+.xterm-btn-g { background: #3fb950; }
+.xterm-title {
+    flex: 1; text-align: center;
+    font-size: 0.74rem; color: #8b949e;
+    letter-spacing: 0.04em;
+}
+.xterm-status-pill {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 0.71rem; color: #8b949e;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 999px;
+    padding: 2px 9px;
+}
+.xterm-status-dot { width: 7px; height: 7px; border-radius: 50%; }
+.xterm-status-dot-anim {
+    animation: xterm-blink 1s ease-in-out infinite;
+}
+
+/* ── Body ── */
+.xterm-body {
+    padding: 14px 18px 10px;
+    min-height: 340px;
+    max-height: 56vh;
+    overflow-y: auto;
+}
+
+/* ── Messages ── */
+.xterm-line-user { color: #58a6ff; margin: 10px 0 1px; }
+.xterm-prompt-glyph { color: #3fb950; }
+.xterm-line-ts { color: #484f58; font-size: 0.69rem; margin: 0 0 4px 0; }
+.xterm-line-ctx {
+    color: #8b949e; font-size: 0.75rem;
+    background: #161b22; border: 1px solid #21262d;
+    border-radius: 5px; padding: 3px 10px;
+    margin: 2px 0 6px 14px; display: inline-block;
+}
+.xterm-line-ai {
+    color: #c9d1d9;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 2px 0 12px 0;
+    padding-left: 14px;
+    border-left: 2px solid #21262d;
+}
+.xterm-cursor { animation: xterm-blink 0.9s step-start infinite; color: #3fb950; }
+.xterm-thinking::after {
+    content: ".";
+    animation: xterm-ellipsis 1.2s steps(1) infinite;
+    color: #58a6ff;
+}
+.xterm-thinking-wrap {
+    color: #58a6ff;
+    padding-left: 14px;
+    font-style: italic;
+    margin-bottom: 10px;
+}
+.xterm-fetch-wrap {
+    color: #f0883e;
+    padding-left: 14px;
+    font-style: italic;
+    margin-bottom: 10px;
+}
+.xterm-err-wrap { color: #f85149; padding-left: 14px; margin-bottom: 10px; }
+
+/* ── Input bar strip (sits between shell and the Streamlit chat_input) ── */
+.xterm-input-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #0d1117;
+    border-left: 1px solid #30363d;
+    border-right: 1px solid #30363d;
+    padding: 6px 14px 4px;
+    font-family: 'Consolas','JetBrains Mono','Courier New',monospace;
+    font-size: 0.88rem;
+}
+.xterm-input-prompt { color: #3fb950; white-space: nowrap; }
+.xterm-input-path   { color: #58a6ff; }
+
+/* ── Override st.chat_input to continue the terminal box ── */
+[data-testid="stChatInputContainer"] {
+    background: #0d1117 !important;
+    border: 1px solid #30363d !important;
+    border-top: none !important;
+    border-radius: 0 0 12px 12px !important;
+    padding: 4px 10px 8px !important;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.45) !important;
+    margin-top: 0 !important;
+}
+[data-testid="stChatInputContainer"] > div {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+[data-testid="stChatInputContainer"] textarea {
+    background: transparent !important;
+    color: #e6edf3 !important;
+    font-family: 'Consolas','JetBrains Mono','Courier New',monospace !important;
+    font-size: 0.88rem !important;
+    caret-color: #3fb950 !important;
+    border: none !important;
+    padding-left: 0 !important;
+}
+[data-testid="stChatInputContainer"] textarea::placeholder {
+    color: #484f58 !important;
+    font-family: 'Consolas','JetBrains Mono','Courier New',monospace !important;
+}
+[data-testid="stChatInputContainer"] button {
+    background: transparent !important;
+    border: 1px solid #30363d !important;
+    border-radius: 6px !important;
+    color: #3fb950 !important;
+}
+[data-testid="stChatInputContainer"] button:hover {
+    background: #21262d !important;
+    border-color: #3fb950 !important;
+}
+
+/* ── Bottom bar (clear + model info) ── */
+.xterm-bottom-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 6px;
+    padding: 0 2px;
+    font-family: 'Consolas','JetBrains Mono','Courier New',monospace;
+    font-size: 0.72rem;
+    color: #484f58;
+}
+</style>
+"""
+
+# ─────────────────────────────────────────────────────────
+# HTML helpers
+# ─────────────────────────────────────────────────────────
+def _esc(text: str) -> str:
+    return _html_module.escape(str(text)).replace("\n", "<br>")
 
 
-# ================================================================
-# Core logic (migrated from old app.py)
-# ================================================================
-def _execute_intent(intent):
-    result = {"type": "text", "content": "", "dashboard_data": None}
+def _build_history_html(messages: list, ai_state: str, streaming_chunk: str = "") -> str:
+    meta = _STATE_META.get(ai_state, _STATE_META[STATE_IDLE])
+    dot_color  = meta["dot"]
+    state_label = meta["label"]
+    dot_class  = "xterm-status-dot xterm-status-dot-anim" if meta["anim"] else "xterm-status-dot"
 
-    if intent.action == "unknown" or intent.error:
-        # Si Ollama está disponible, dejar que el LLM responda libremente
-        # en lugar de mostrar un mensaje de error estático
-        if st.session_state.ollama_ok:
-            try:
-                reply = chat_as_agent(intent.raw_query, machine_names=get_machine_names())
-                result["content"] = reply
-            except Exception:
-                result["content"] = (
-                    intent.error
-                    or "No pude procesar tu pregunta. Intenta algo como:\n"
-                    "- *¿Cuáles son los datos de hoy de la Paste Printer L1L?*\n"
-                    "- *Muéstrame outliers del Reflow de la Línea 3*"
-                )
+    # History lines
+    history_html = ""
+    for msg in messages:
+        if msg["role"] == "user":
+            history_html += (
+                f"<div class='xterm-line-user'>"
+                f"<span class='xterm-prompt-glyph'>mip@kimball:~$</span>&nbsp;{_esc(msg['content'])}"
+                f"</div>"
+                f"<div class='xterm-line-ts'>{msg.get('ts','')}</div>"
+            )
         else:
-            result["content"] = (
-                intent.error
-                or "No entendí tu pregunta. Prueba algo como:\n"
-                "- *¿Cuáles son los datos de hoy de la Paste Printer L1L?*\n"
-                "- *Muéstrame outliers del Reflow de la Línea 3*"
+            ctx = msg.get("ctx", "")
+            ctx_html = (
+                f"<div class='xterm-line-ctx'>&#128225;&nbsp;datos cargados: {_esc(ctx)}</div>"
+                if ctx else ""
             )
-        return result
-
-    if intent.action == "chat":
-        try:
-            reply = chat_as_agent(intent.raw_query, machine_names=get_machine_names())
-            result["content"] = reply
-        except Exception as e:
-            result["content"] = "Hubo un error al conectar con el modelo de IA."
-        return result
-
-    if intent.action == "list_machines":
-        result["type"] = "machine_list"
-        result["content"] = "Aquí están las máquinas disponibles:"
-        return result
-
-    if intent.action in ("show_dashboard", "show_attribute", "status_check", "compare"):
-        raw_query = intent.raw_query or ""
-
-        # ---- Resolver maquina con busqueda inteligente ----
-        if not intent.machine_name:
-            # El parser no extrajo nombre: buscar por el texto completo del query
-            matches = smart_find_machine(raw_query, line_hint=intent.line_hint)
-        else:
-            matches = find_machine(intent.machine_name, line_hint=intent.line_hint)
-            if matches.empty:
-                # Busqueda ampliada con sinonimos
-                matches = smart_find_machine(intent.machine_name, line_hint=intent.line_hint)
-
-        # ---- Fallback: LLM elige entre todos los candidatos ----
-        if matches.empty and st.session_state.ollama_ok:
-            all_names = get_machine_names()
-            with st.spinner("Buscando la maquina mas relevante..."):
-                chosen = llm_pick_machine(raw_query, all_names)
-            if chosen:
-                matches = find_machine(chosen, line_hint=intent.line_hint)
-                if matches.empty:
-                    matches = smart_find_machine(chosen, line_hint=intent.line_hint)
-
-        if matches.empty:
-            all_names = get_machine_names()
-            # Mostrar solo los primeros de cada tipo para no saturar
-            result["content"] = (
-                "No encontre una maquina que coincida con tu descripcion. "
-                "Puedes buscar por tipo (Reflow, Paste Printer, AOI, SPI...) o por linea. "
-                "Maquinas disponibles:\n"
-                + ", ".join(f"**{n}**" for n in all_names[:20])
-                + (f" ...y {len(all_names)-20} mas." if len(all_names) > 20 else "")
+            history_html += (
+                f"{ctx_html}"
+                f"<div class='xterm-line-ai'>{_esc(msg['content'])}</div>"
             )
-            return result
 
-        if len(matches) > 1:
-            result["type"] = "disambiguation"
-            result["matches"] = matches
-            result["intent"] = intent
-            machine_list = "\n".join(
-                f"- **{row['machine_name']}** · {row['line_name']}"
-                for _, row in matches.iterrows()
-            )
-            result["content"] = (
-                f"Encontré **{len(matches)}** máquinas que coinciden con "
-                f"**{intent.machine_name}**. ¿A cuál te refieres?\n\n{machine_list}"
-            )
-            st.session_state.pending_intent = intent
-            return result
+    # Live indicator
+    live_html = ""
+    if ai_state == STATE_STREAMING and streaming_chunk:
+        live_html = (
+            f"<div class='xterm-line-ai'>{_esc(streaming_chunk)}"
+            f"<span class='xterm-cursor'>&#9646;</span></div>"
+        )
+    elif ai_state == STATE_THINKING:
+        live_html = (
+            "<div class='xterm-thinking-wrap'>"
+            "<span class='xterm-thinking'>deepseek thinking</span></div>"
+        )
+    elif ai_state == STATE_FETCHING:
+        live_html = (
+            "<div class='xterm-fetch-wrap'>"
+            "<span class='xterm-thinking'>fetching PI data</span></div>"
+        )
+    elif ai_state == STATE_ERROR:
+        live_html = "<div class='xterm-err-wrap'>&#9888; Error en la ultima consulta. Intenta de nuevo.</div>"
 
-        machine = matches.iloc[0]
-        machine_path = machine["machine_path"]
-        machine_name = machine["machine_name"]
+    return f"""
+{_TERM_CSS}
+<div class="xterm-shell">
+  <div class="xterm-titlebar">
+    <span class="xterm-btn xterm-btn-r"></span>
+    <span class="xterm-btn xterm-btn-y"></span>
+    <span class="xterm-btn xterm-btn-g"></span>
+    <div class="xterm-title">MIP Terminal &mdash; {OLLAMA_MODEL}</div>
+    <div class="xterm-status-pill">
+      <span class="{dot_class}" style="background:{dot_color};box-shadow:0 0 5px {dot_color};"></span>
+      {state_label}
+    </div>
+  </div>
+  <div class="xterm-body" id="xterm-body">
+    <div style="color:#3fb950;margin-bottom:8px;font-size:0.77rem;">
+      Machine Intelligence Platform &mdash; {OLLAMA_MODEL}<br>
+      <span style="color:#484f58;">Connected to PI System. Type a question below.</span>
+    </div>
+    <hr style="border:none;border-top:1px solid #21262d;margin:6px 0 12px;">
+    {history_html}
+    {live_html}
+  </div>
+</div>
+<div class="xterm-input-strip">
+  <span class="xterm-input-prompt">mip</span>
+  <span style="color:#484f58;">@</span>
+  <span class="xterm-input-path">kimball</span>
+  <span style="color:#484f58;">:~$</span>
+</div>
+"""
 
+# ─────────────────────────────────────────────────────────
+# Machine context helpers
+# ─────────────────────────────────────────────────────────
+def _machine_context_text(machine_name: str, machine_path: str, hours: float = 1.0) -> str:
+    try:
         tags_df = get_machine_tags(machine_path)
         if tags_df.empty:
-            result["content"] = f"La máquina **{machine_name}** no tiene tags consultables."
-            return result
-
-        if intent.attribute_name and intent.action == "show_attribute":
-            attr_lower = intent.attribute_name.lower()
-            mask = tags_df["name"].str.lower().str.contains(attr_lower, na=False)
-            filtered = tags_df[mask]
-            if not filtered.empty:
-                tags_df = filtered
-
-        from_dt = intent.from_dt or datetime.now().replace(hour=0, minute=0, second=0)
-        to_dt = intent.to_dt or datetime.now()
-        tag_names = tags_df["piPoint"].astype(str).tolist()  # sin limite
-
-        with st.spinner(f"Consultando {len(tag_names)} tags de {machine_name}…"):
-            all_data = fetch_tag_values(tag_names, from_dt, to_dt)
-
+            return f"[Sin tags para {machine_name}]"
+        tag_names = tags_df["piPoint"].astype(str).tolist()
+        to_dt = datetime.now()
+        from_dt = to_dt - timedelta(hours=hours)
+        all_data = fetch_tag_values(tag_names, from_dt, to_dt)
         if all_data.empty:
-            result["content"] = f"No hay datos disponibles para **{machine_name}** en el rango."
-            return result
-
-        tag_data = {}
-        for tag_name in tag_names:
-            tag_df = all_data[all_data["Tag_Name"] == tag_name].copy()
-            if not tag_df.empty:
-                tag_data[tag_name] = tag_df
-
-        # Determinar qué herramientas mostrar
-        show_dashboard = st.session_state.opt_dashboard
-        show_excel     = st.session_state.opt_excel
-        show_analysis  = st.session_state.opt_analysis
-
-        # Si NINGUNA herramienta está activa, la IA decide según el prompt
-        if not show_dashboard and not show_excel and not show_analysis:
-            q = (intent.raw_query or "").lower()
-            # Palabras clave que indican análisis / tendencias
-            analysis_kw = {"analiz", "tendencia", "trend", "outlier", "anomal", "variab",
-                           "compara", "estable", "inestable", "fluctu", "evalúa", "evalua",
-                           "resume", "resum", "explica", "explica", "diagnos"}
-            # Palabras clave que indican exportación
-            export_kw   = {"excel", "exporta", "descarga", "csv", "archivo", "report"}
-            # Palabras clave que piden gráfica explícita
-            chart_kw    = {"gráfica", "grafica", "chart", "visual", "dashboard",
-                           "muestra", "pinta", "plot", "dibuja"}
-
-            wants_analysis = any(k in q for k in analysis_kw)
-            wants_export   = any(k in q for k in export_kw)
-            wants_chart    = bool(intent.chart_instructions) or any(k in q for k in chart_kw)
-
-            # Por defecto siempre mostrar dashboard; análisis si IA disponible
-            show_dashboard = wants_chart or (not wants_analysis and not wants_export)
-            show_analysis  = wants_analysis or (st.session_state.ollama_ok and not wants_export)
-            show_excel     = wants_export
-
-        result.update({
-            "type":  "dashboard",
-            "machine_name":   machine_name,
-            "tag_data":       tag_data,
-            "all_data":       all_data,
-            "time_range":     intent.time_range,
-            "chart_instructions": intent.chart_instructions or [],
-            "content": intent.summary_text or f"Datos de {machine_name} ({intent.time_range})",
-            "show_dashboard": show_dashboard,
-            "show_excel":     show_excel,
-            "show_analysis":  show_analysis,
-        })
-
-        if show_analysis and st.session_state.ollama_ok and tag_data:
-            try:
-                summary_text = build_data_summary_text(tag_data)
-                with st.spinner("🧠 Generando análisis inteligente…"):
-                    llm_answer = answer_user_question(
-                        user_question=intent.raw_query,
-                        machine_name=machine_name,
-                        data_summary=summary_text,
+            return f"[Sin datos en la ultima {hours:.0f}h para {machine_name}]"
+        lines = [f"=== Datos de {machine_name} (ultima {hours:.0f}h) ==="]
+        for tn in tag_names:
+            sub = all_data[all_data["Tag_Name"] == tn].copy()
+            if sub.empty:
+                continue
+            short = tn.split(".")[-1] if "." in tn else tn
+            mode = infer_tag_mode(sub)
+            if mode == "numeric":
+                s = numeric_summary(sub)
+                if s:
+                    lines.append(
+                        f"  {short}: ultimo={s.get('last',0):.3f}  "
+                        f"min={s.get('min',0):.3f}  max={s.get('max',0):.3f}  "
+                        f"prom={s.get('mean',0):.3f}  CV%={s.get('cv_pct',0):.1f}"
                     )
-                result["llm_summary"] = llm_answer
-            except Exception:
-                result["llm_summary"] = None
-
-        return result
-
-    result["content"] = "Procesando tu solicitud…"
-    return result
-
-
-def _process_query(user_query: str):
-    """Agrega el mensaje del usuario al historial y marca para procesamiento diferido."""
-    st.session_state.chat_history.append({
-        "role": "user", "content": user_query, "timestamp": datetime.now(),
-    })
-    st.session_state._pending_query = user_query
+            else:
+                s = categorical_summary(sub)
+                if s:
+                    lines.append(f"  {short}: ultimo={s.get('last','?')}  estados={s.get('unique_count','?')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[Error: {e}]"
 
 
-def _process_pending():
-    """
-    Procesa la consulta pendiente con streaming para respuestas conversacionales.
-    Llamado en render() despues de mostrar el historial, para que el usuario
-    vea su mensaje de inmediato antes de esperar la respuesta.
-    """
-    query = st.session_state.pop("_pending_query")
-    time_override = st.session_state.get("ui_time_range", "today")
-    custom_from = st.session_state.get("ui_custom_from", date.today())
-    custom_to   = st.session_state.get("ui_custom_to",   date.today())
+def _detect_machine(query: str):
+    try:
+        matches = smart_find_machine(query)
+        if not matches.empty:
+            row = matches.iloc[0]
+            return row["machine_name"], row["machine_path"]
+    except Exception:
+        pass
+    return None, None
 
-    # Parsear intención
-    if st.session_state.ollama_ok:
-        with st.spinner("Interpretando..."):
-            try:
-                intent = parse_query(query)
-            except Exception:
-                intent = parse_query_fallback(query, get_machine_names())
-    else:
-        intent = parse_query_fallback(query, get_machine_names())
 
-    # Aplicar override de tiempo
-    if time_override == "custom":
-        intent.time_range = "custom"
-        intent.from_dt = datetime.combine(custom_from, time(0, 0, 0))
-        intent.to_dt   = datetime.combine(custom_to,   time(23, 59, 59))
-    elif time_override == "current":
-        now = datetime.now()
-        intent.time_range = "current"
-        intent.from_dt = now - timedelta(minutes=30)
-        intent.to_dt   = now
-    else:
-        intent.time_range = time_override
-        intent.from_dt, intent.to_dt = resolve_time_range(time_override)
+# ─────────────────────────────────────────────────────────
+# Estado de sesion
+# ─────────────────────────────────────────────────────────
+def _init():
+    defaults = {
+        "term_messages":  [],
+        "term_state":     STATE_IDLE,
+        "term_streaming": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # Respuestas conversacionales: streaming directo (se ven los tokens en tiempo real)
-    if intent.action in ("chat", "unknown") and st.session_state.ollama_ok:
-        with st.container():
-            st.markdown(
-                '<div class="ai-row"><div class="ai-avatar">AI</div></div>',
+
+# ─────────────────────────────────────────────────────────
+# Procesar mensaje
+# ─────────────────────────────────────────────────────────
+def _handle_message(user_input: str, terminal_placeholder):
+    ts = datetime.now().strftime("%H:%M:%S")
+    st.session_state.term_messages.append({"role": "user", "content": user_input, "ts": ts})
+
+    # Estado: fetching
+    st.session_state.term_state = STATE_FETCHING
+    terminal_placeholder.markdown(
+        _build_history_html(st.session_state.term_messages, STATE_FETCHING),
+        unsafe_allow_html=True,
+    )
+
+    # Contexto de maquina
+    machine_name, machine_path = _detect_machine(user_input)
+    ctx_label = ""
+    extra_context = ""
+    if machine_name and machine_path:
+        ctx_label = machine_name
+        extra_context = "\n\n" + _machine_context_text(machine_name, machine_path)
+
+    names = get_machine_names()
+    machines_hint = f"\n\nMaquinas disponibles: {', '.join(names[:40])}" if names else ""
+    system = _BASE_SYSTEM + machines_hint + extra_context
+
+    MAX_TURNS = 14
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.term_messages[-MAX_TURNS:]
+    ]
+
+    # Estado: thinking
+    st.session_state.term_state = STATE_THINKING
+    terminal_placeholder.markdown(
+        _build_history_html(st.session_state.term_messages, STATE_THINKING),
+        unsafe_allow_html=True,
+    )
+
+    # Streaming
+    st.session_state.term_state = STATE_STREAMING
+    full_response = ""
+    error_msg = ""
+    try:
+        stream = terminal_chat_stream(history, system)
+        for chunk in stream:
+            full_response += chunk
+            terminal_placeholder.markdown(
+                _build_history_html(st.session_state.term_messages, STATE_STREAMING, full_response),
                 unsafe_allow_html=True,
             )
-            try:
-                response_text = st.write_stream(
-                    chat_as_agent_stream(query, machine_names=get_machine_names())
-                )
-            except Exception as e:
-                response_text = f"Error al conectar con el modelo: {e}"
-                st.error(response_text)
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": response_text,
-            "result": {"type": "text"},
-            "timestamp": datetime.now(),
-        })
-        st.rerun()
-        return
+    except Exception as e:
+        error_msg = str(e)
 
-    # Consultas de datos: spinner + ejecución regular
-    with st.spinner("Procesando..."):
-        result = _execute_intent(intent)
-    st.session_state.chat_history.append({
+    # Guardar respuesta
+    final_content = full_response if full_response else f"[Error: {error_msg}]"
+    st.session_state.term_messages.append({
         "role": "assistant",
-        "content": result.get("content", ""),
-        "result": result,
-        "timestamp": datetime.now(),
+        "content": final_content,
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "ctx": ctx_label,
     })
+    st.session_state.term_state = STATE_ERROR if (not full_response and error_msg) else STATE_IDLE
+    st.session_state.term_streaming = ""
     st.rerun()
 
 
-def _select_disambiguation(exact_name: str):
-    intent = st.session_state.pending_intent
-    if intent is None:
-        return
-    intent.machine_name = exact_name
-    st.session_state.pending_intent = None
-    st.session_state.chat_history.append({
-        "role": "user",
-        "content": f"Me refiero a **{exact_name}**",
-        "timestamp": datetime.now(),
-    })
-    with st.spinner("⚙️ Trabajando en el análisis…"):
-        result = _execute_intent(intent)
-    st.session_state.chat_history.append({
-        "role": "assistant",
-        "content": result.get("content", ""),
-        "result": result,
-        "timestamp": datetime.now(),
-    })
-
-
-def _render_excel_download(result: dict):
-    tag_data = result.get("tag_data") or {}
-    all_data = result.get("all_data")
-    if not tag_data and (all_data is None or all_data.empty):
-        return
-    machine_name = result.get("machine_name", "datos")
-    safe_name = machine_name.replace(" ", "_").replace("/", "_")[:30]
-    time_range = result.get("time_range", "data")
-
-    def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        for col in df.columns:
-            if hasattr(df[col], "dt") and hasattr(df[col].dt, "tz"):
-                if df[col].dt.tz is not None:
-                    df[col] = df[col].dt.tz_localize(None)
-        return df
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if tag_data:
-            for tag_name, df in tag_data.items():
-                short = tag_name.split(".")[-1] if "." in tag_name else tag_name
-                sheet_name = short[:31].replace("/", "-").replace(":", "-")
-                clean_df = _strip_tz(df)
-                export_cols = [c for c in ["TimeStamp", "Value_Raw", "Value_Num", "Value_Str", "Tag_Type"] if c in clean_df.columns]
-                clean_df[export_cols].to_excel(writer, index=False, sheet_name=sheet_name)
-            if all_data is not None and not all_data.empty:
-                _strip_tz(all_data).to_excel(writer, index=False, sheet_name="Resumen")
-        else:
-            _strip_tz(all_data).to_excel(writer, index=False, sheet_name="Datos")
-    excel_bytes = output.getvalue()
-    with st.container(border=True):
-        st.markdown(f"**📥 Exportar datos** — {len(tag_data)} parámetros")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "Descargar Excel",
-                data=excel_bytes,
-                file_name=f"{safe_name}_{time_range}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with c2:
-            if all_data is not None and not all_data.empty:
-                csv_bytes = _strip_tz(all_data).to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Descargar CSV",
-                    data=csv_bytes,
-                    file_name=f"{safe_name}_{time_range}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-
-
-def _render_chat_history():
-    for entry_idx, entry in enumerate(st.session_state.chat_history):
-        if entry["role"] == "user":
-            st.markdown(
-                f'<div class="user-row"><div class="user-bubble">{entry["content"]}</div></div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            result = entry.get("result", {})
-            res_type = result.get("type", "text")
-
-            st.markdown(
-                f'<div class="ai-row">'
-                f'<div class="ai-avatar">AI</div>'
-                f'<div class="ai-text">{entry["content"]}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-            if result.get("llm_summary") and result.get("show_analysis", True):
-                with st.container(border=True):
-                    st.markdown("##### 💡 Análisis inteligente")
-                    st.markdown(result["llm_summary"])
-
-            if res_type == "dashboard" and result.get("show_excel") and "all_data" in result:
-                _render_excel_download(result)
-
-            if res_type == "dashboard" and "tag_data" in result and result.get("show_dashboard", True):
-                render_machine_dashboard(
-                    result["machine_name"],
-                    result["tag_data"],
-                    time_range_label=result.get("time_range", "hoy"),
-                    chart_instructions=result.get("chart_instructions", []),
-                )
-            elif res_type == "disambiguation" and "matches" in result:
-                cols = st.columns(min(3, len(result["matches"])))
-                for idx, (_, row) in enumerate(result["matches"].iterrows()):
-                    with cols[idx % len(cols)]:
-                        if st.button(
-                            f"📍 {row['machine_name']}\n{row['line_name']}",
-                            key=f"disamb_{entry_idx}_{idx}",
-                            use_container_width=True,
-                        ):
-                            _select_disambiguation(row["machine_name"])
-                            st.rerun()
-            elif res_type == "machine_list":
-                machines_df = discover_machines()
-                chosen = render_machine_list(machines_df)
-                if chosen:
-                    _process_query(f"Dame los datos de hoy de {chosen}")
-                    st.rerun()
-
-
-# ================================================================
-# Public render
-# ================================================================
+# ─────────────────────────────────────────────────────────
+# Render principal
+# ─────────────────────────────────────────────────────────
 def render():
-    ai_pill = '<span class="pill pill-ok">● IA Online</span>' if st.session_state.ollama_ok \
-              else '<span class="pill pill-err">● IA Offline</span>'
-    model_pill = f'<span class="pill pill-primary">{OLLAMA_MODEL}</span>'
+    _init()
 
-    page_header(
-        eyebrow="Mosaic AI · Agent",
-        title="Agente conversacional",
-        subtitle="Pregunta en lenguaje natural sobre cualquier máquina, parámetro o período. "
-                 "El agente consulta PI, genera dashboards y analiza los datos por ti.",
-        right_html=f"{ai_pill}&nbsp;{model_pill}",
+    state = st.session_state.term_state
+    is_busy = state not in (STATE_IDLE, STATE_ERROR)
+
+    # Header
+    st.markdown(
+        f"<h2 style='margin-bottom:0.1rem;font-family:Consolas,monospace;'>&#11035; MIP Terminal</h2>"
+        f"<p style='color:#6e7681;font-size:0.82rem;margin-top:0;'>"
+        f"deepseek-coder-v2 via Ollama &middot; PI System context &middot; multi-turn</p>",
+        unsafe_allow_html=True,
     )
 
-    # -------- Toolbar (tiempo + herramientas) --------
-    with st.container(border=True):
-        c1, c2, c3 = st.columns([2, 2, 3])
-        with c1:
-            st.markdown("**⏱️ Período**")
-            ranges = {
-                "today": "Hoy",
-                "yesterday": "Ayer",
-                "last_hour": "Última hora",
-                "last_24h": "Últimas 24h",
-                "last_week": "Última semana",
-                "current": "Ahora (30min)",
-                "custom": "Personalizado",
-            }
-            st.session_state.ui_time_range = st.selectbox(
-                "Rango",
-                options=list(ranges.keys()),
-                format_func=lambda k: ranges[k],
-                index=list(ranges.keys()).index(st.session_state.ui_time_range),
-                label_visibility="collapsed",
-            )
-            if st.session_state.ui_time_range == "custom":
-                d1, d2 = st.columns(2)
-                with d1:
-                    st.session_state.ui_custom_from = st.date_input("Desde", st.session_state.ui_custom_from, label_visibility="collapsed")
-                with d2:
-                    st.session_state.ui_custom_to = st.date_input("Hasta", st.session_state.ui_custom_to, label_visibility="collapsed")
+    # Terminal placeholder (history + titlebar)
+    terminal_placeholder = st.empty()
+    terminal_placeholder.markdown(
+        _build_history_html(
+            st.session_state.term_messages,
+            state,
+            st.session_state.term_streaming,
+        ),
+        unsafe_allow_html=True,
+    )
 
-        with c2:
-            st.markdown("**🧰 Herramientas activas**")
-            st.session_state.opt_dashboard = st.toggle("Dashboard visual", st.session_state.opt_dashboard)
-            st.session_state.opt_analysis  = st.toggle("Análisis IA",       st.session_state.opt_analysis)
-            st.session_state.opt_excel     = st.toggle("Exportar Excel",    st.session_state.opt_excel)
+    # Input — nativo de Streamlit, estilizado via CSS para continuar el terminal
+    placeholder_text = (
+        "mip@kimball:~$  escribe un mensaje..."
+        if not is_busy
+        else f"  {state}..."
+    )
+    prompt = st.chat_input(placeholder_text, key="term_input", disabled=is_busy)
 
-        with c3:
-            st.markdown("**🎯 Sugerencias**")
-            sug_cols = st.columns(2)
-            for i, sug in enumerate(QUERY_SUGGESTIONS[:6]):
-                with sug_cols[i % 2]:
-                    if st.button(sug, key=f"agent_sug_{i}", use_container_width=True):
-                        _process_query(sug)
-                        st.rerun()
-
-    # -------- Historial --------
-    if not st.session_state.chat_history:
-        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-        st.info("💬 Haz tu primera pregunta abajo o selecciona una sugerencia.")
-    else:
-        _render_chat_history()
-
-    # -------- Procesar consulta pendiente (DESPUES del historial para que el usuario
-    # vea su mensaje de inmediato antes de que aparezca la respuesta) --------
-    if "_pending_query" in st.session_state:
-        _process_pending()
-        return  # _process_pending() llama a st.rerun() internamente
-
-    # -------- Input --------
-    prefill = st.session_state.pop("_prefill_query", "")
-    prompt = st.chat_input("Pregúntame sobre cualquier máquina o parámetro…")
-    if prefill and not prompt:
-        prompt = prefill
-
-    if prompt:
-        _process_query(prompt)
-        st.rerun()
-
-    # Clear chat
-    if st.session_state.chat_history:
-        if st.button("🗑️ Limpiar conversación", key="agent_view_clear_chat"):
-            st.session_state.chat_history = []
+    # Bottom bar
+    col_info, col_clear = st.columns([5, 1])
+    with col_info:
+        n_msg = len([m for m in st.session_state.term_messages if m["role"] == "user"])
+        st.markdown(
+            f"<div class='xterm-bottom-bar'>"
+            f"{OLLAMA_MODEL} &nbsp;|&nbsp; {n_msg} mensajes &nbsp;|&nbsp; "
+            f"PI System {'&#x2022; online' if st.session_state.get('machines_loaded') else '&#x2022; offline'}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with col_clear:
+        if st.button("🗑 Clear", use_container_width=True, help="Limpiar conversacion"):
+            st.session_state.term_messages = []
+            st.session_state.term_state = STATE_IDLE
             st.rerun()
+
+    if prompt and prompt.strip() and not is_busy:
+        if not st.session_state.get("ollama_ok"):
+            st.error("Ollama no disponible. Verifica que el servidor este corriendo en localhost:11434")
+            return
+        _handle_message(prompt.strip(), terminal_placeholder)

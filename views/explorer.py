@@ -135,10 +135,11 @@ def render():
                             st.session_state.selected_machine_path = row["machine_path"]
                             goto("monitor")
                     with b2:
-                        if st.button("🔬 Analytics", key=f"exp_an_{line_name}_{row['machine_name']}_{i}", use_container_width=True):
+                        if st.button("🎮 Playground", key=f"exp_an_{line_name}_{row['machine_name']}_{i}", use_container_width=True):
                             st.session_state.selected_machine_name = row["machine_name"]
                             st.session_state.selected_machine_path = row["machine_path"]
                             st.session_state.analytics_machine = row["machine_name"]
+                            st.session_state.playground_params = []  # reset param selection for the new machine
                             goto("analytics")
 
                     with st.expander("Ver tags"):

@@ -388,6 +388,90 @@ def inject_global_css():
         border-top: 1px solid var(--border);
         margin-top: 2rem;
       }}
+
+      /* =========== LOADING OVERLAY =========== */
+      @keyframes mip-spin {{
+        0%   {{ transform: rotate(0deg); }}
+        100% {{ transform: rotate(360deg); }}
+      }}
+      @keyframes mip-pulse {{
+        0%, 100% {{ opacity: 1; }}
+        50%       {{ opacity: 0.4; }}
+      }}
+      @keyframes mip-bar {{
+        0%   {{ left: -40%; width: 40%; }}
+        50%  {{ left: 20%;  width: 60%; }}
+        100% {{ left: 110%; width: 40%; }}
+      }}
+
+      /* Full-section loader card */
+      .mip-loader {{
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.1rem;
+        padding: 3.5rem 2rem;
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        background: var(--surface);
+        box-shadow: 0 4px 24px rgba(15,23,42,0.05);
+        min-height: 220px;
+      }}
+      .mip-loader-ring {{
+        width: 52px; height: 52px;
+        border: 4px solid rgba(79,70,229,0.12);
+        border-top: 4px solid var(--primary);
+        border-radius: 50%;
+        animation: mip-spin 0.9s linear infinite;
+      }}
+      .mip-loader-label {{
+        font-size: 0.92rem;
+        font-weight: 600;
+        color: var(--ink-muted);
+        letter-spacing: 0.01em;
+        animation: mip-pulse 1.6s ease-in-out infinite;
+      }}
+      .mip-loader-sub {{
+        font-size: 0.78rem;
+        color: #94a3b8;
+      }}
+
+      /* Progress bar (top of section) */
+      .mip-progress-bar {{
+        position: relative;
+        height: 3px;
+        width: 100%;
+        background: rgba(79,70,229,0.08);
+        border-radius: 999px;
+        overflow: hidden;
+        margin-bottom: 1.2rem;
+      }}
+      .mip-progress-bar::after {{
+        content: "";
+        position: absolute;
+        top: 0; height: 100%;
+        background: linear-gradient(90deg, var(--primary), var(--accent));
+        border-radius: 999px;
+        animation: mip-bar 1.4s ease-in-out infinite;
+      }}
+
+      /* Skeleton shimmer */
+      @keyframes mip-shimmer {{
+        0%   {{ background-position: -400px 0; }}
+        100% {{ background-position: 400px 0; }}
+      }}
+      .mip-skeleton {{
+        background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 50%, #e2e8f0 75%);
+        background-size: 800px 100%;
+        animation: mip-shimmer 1.4s infinite;
+        border-radius: 8px;
+        height: 14px;
+        width: 100%;
+        margin: 6px 0;
+      }}
+      .mip-skeleton-wide  {{ width: 80%; }}
+      .mip-skeleton-short {{ width: 45%; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -402,6 +486,20 @@ def page_header(eyebrow: str, title: str, subtitle: str = "", right_html: str = 
         <div class="sub">{subtitle}</div>
       </div>
       <div>{right_html}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def show_loader(label: str = "Cargando…", sub: str = "", progress_bar: bool = True):
+    """Muestra un loader de sección grande con animación mientras Streamlit carga datos."""
+    bar_html = '<div class="mip-progress-bar"></div>' if progress_bar else ""
+    sub_html = f'<div class="mip-loader-sub">{sub}</div>' if sub else ""
+    st.markdown(f"""
+    {bar_html}
+    <div class="mip-loader">
+      <div class="mip-loader-ring"></div>
+      <div class="mip-loader-label">{label}</div>
+      {sub_html}
     </div>
     """, unsafe_allow_html=True)
 

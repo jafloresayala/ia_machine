@@ -135,7 +135,7 @@ def fetch_tag_values(
     # Parsear SIN utc=True preserva ese horario local; luego quitamos el tz-info
     # para dejar un datetime naive con la hora correcta de planta.
     raw_ts = pd.to_datetime(df["TimeStamp"], errors="coerce")
-    if getattr(raw_ts.dt, "tz", None) is not None:
+    if pd.api.types.is_datetime64_any_dtype(raw_ts) and raw_ts.dt.tz is not None:
         # Hay offset embebido: preservar la hora de reloj, quitar info de zona
         df["TimeStamp"] = raw_ts.apply(
             lambda x: x.replace(tzinfo=None) if x is not pd.NaT else pd.NaT

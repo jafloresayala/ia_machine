@@ -19,15 +19,43 @@ import streamlit as st
 
 from llm_engine import chat_completion_json, chat_completion, _extract_json
 
-# Optional: statsmodels para ARIMA/SARIMA (pip install statsmodels)
+# Optional: statsmodels para ARIMA/SARIMA/HW/ETS (pip install statsmodels)
 try:
     from statsmodels.tsa.stattools import acf as _sm_acf, pacf as _sm_pacf
     from statsmodels.tsa.ar_model import AutoReg as _AutoReg
     from statsmodels.tsa.arima.model import ARIMA as _ARIMA
     from statsmodels.tsa.statespace.sarimax import SARIMAX as _SARIMAX
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing as _HoltWinters
     _HAS_STATSMODELS = True
 except ImportError:
     _HAS_STATSMODELS = False
+
+# Optional: sklearn para modelos ML (pip install scikit-learn)
+try:
+    from sklearn.linear_model import (
+        Ridge as _Ridge, Lasso as _Lasso, ElasticNet as _ElasticNet,
+        BayesianRidge as _BayesianRidge, HuberRegressor as _HuberRegressor,
+        TheilSenRegressor as _TheilSen,
+    )
+    from sklearn.svm import SVR as _SVR
+    from sklearn.ensemble import (
+        RandomForestRegressor as _RF, GradientBoostingRegressor as _GBR,
+        ExtraTreesRegressor as _ET,
+    )
+    from sklearn.neighbors import KNeighborsRegressor as _KNN
+    from sklearn.preprocessing import PolynomialFeatures as _PolyFeatures
+    from sklearn.pipeline import make_pipeline as _make_pipeline
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
+
+# Optional: scipy para lowess y splines
+try:
+    from scipy.stats import linregress as _linregress
+    from scipy.interpolate import CubicSpline as _CubicSpline
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
 
 
 # ==================================================================
@@ -1449,19 +1477,23 @@ def _analysis_pacf(df, nlags: int = 40) -> dict:
 
 
 # ---- AR ----
-def _analysis_ar(df, horizon_s: float) -> dict:
+def _analysis_ar(df, horizon_s: float, p: int | None = None) -> dict:
     ts = _prep_ts_data(df)
     if ts is None:
         return {"error": "Se necesitan datos numericos con timestamps para AR."}
     yval, secs, step_s, t0 = ts["yval"], ts["secs"], ts["step_s"], ts["t0"]
     n = len(yval)
 
-    # Seleccionar orden p via PACF
-    max_p = min(20, n // 5)
-    pacf_vals, ci = _compute_pacf_values(yval, max_p)
-    sig_lags = [k for k, v in enumerate(pacf_vals[1:], 1) if abs(v) > ci]
-    p = sig_lags[-1] if sig_lags else min(5, max_p)
-    p = max(1, min(p, max_p))
+    if p is None:
+        # Seleccionar orden p via PACF
+        max_p = min(20, n // 5)
+        pacf_vals, ci = _compute_pacf_values(yval, max_p)
+        sig_lags = [k for k, v in enumerate(pacf_vals[1:], 1) if abs(v) > ci]
+        p = sig_lags[-1] if sig_lags else min(5, max_p)
+        p = max(1, min(p, max_p))
+    else:
+        max_p = min(20, n // 5)
+        p = max(1, min(int(p), max_p))
 
     if _HAS_STATSMODELS:
         try:
@@ -1547,7 +1579,7 @@ def _analysis_ma(df, horizon_s: float) -> dict:
 
 
 # ---- ARIMA ----
-def _analysis_arima(df, horizon_s: float) -> dict:
+def _analysis_arima(df, horizon_s: float, order: tuple | None = None) -> dict:
     ts = _prep_ts_data(df)
     if ts is None:
         return {"error": "Se necesitan datos numericos con timestamps para ARIMA."}
@@ -1557,19 +1589,28 @@ def _analysis_arima(df, horizon_s: float) -> dict:
         return {"error": "ARIMA requiere statsmodels. Instala con: pip install statsmodels"}
 
     try:
-        # Auto-select orders: try (2,1,2), (1,1,1), (1,0,1), fall back to (1,1,0)
-        best_aic = float("inf")
-        best_mdl = None
-        best_order = (1, 1, 1)
-        for order in [(1, 1, 1), (2, 1, 2), (1, 0, 1), (1, 1, 0), (0, 1, 1)]:
-            try:
-                m = _ARIMA(yval, order=order).fit()
-                if m.aic < best_aic:
-                    best_aic  = m.aic
-                    best_mdl  = m
-                    best_order = order
-            except Exception:
-                pass
+        if order is not None:
+            # Use specified order directly
+            mdl = _ARIMA(yval, order=order).fit()
+            best_aic = mdl.aic
+            best_mdl = mdl
+            best_order = order
+            info_suffix = "(orden especificado)"
+        else:
+            # Auto-select orders: try (2,1,2), (1,1,1), (1,0,1), fall back to (1,1,0)
+            best_aic = float("inf")
+            best_mdl = None
+            best_order = (1, 1, 1)
+            info_suffix = "(mejor de 5 variantes)"
+            for order in [(1, 1, 1), (2, 1, 2), (1, 0, 1), (1, 1, 0), (0, 1, 1)]:
+                try:
+                    m = _ARIMA(yval, order=order).fit()
+                    if m.aic < best_aic:
+                        best_aic  = m.aic
+                        best_mdl  = m
+                        best_order = order
+                except Exception:
+                    pass
         if best_mdl is None:
             return {"error": "No se pudo ajustar ninguna variante ARIMA."}
 
@@ -1582,14 +1623,14 @@ def _analysis_arima(df, horizon_s: float) -> dict:
             fc, future_ts, yval, t_last, residuals,
             f"ARIMA{best_order}", "#f59e0b"
         )
-        info = f"ARIMA{best_order} — AIC={best_aic:.2f} (mejor de 5 variantes)"
+        info = f"ARIMA{best_order} — AIC={best_aic:.2f} {info_suffix}"
         return {"overlays": overlays, "sub_charts": [], "explanation": info}
     except Exception as e:
         return {"error": f"ARIMA fallido: {e}"}
 
 
 # ---- SARIMA ----
-def _analysis_sarima(df, horizon_s: float) -> dict:
+def _analysis_sarima(df, horizon_s: float, order: tuple | None = None, seasonal_order: tuple | None = None) -> dict:
     ts = _prep_ts_data(df)
     if ts is None:
         return {"error": "Se necesitan datos numericos con timestamps para SARIMA."}
@@ -1599,7 +1640,7 @@ def _analysis_sarima(df, horizon_s: float) -> dict:
         return {"error": "SARIMA requiere statsmodels. Instala con: pip install statsmodels"}
 
     try:
-        # Infer seasonal period from FFT
+        # Infer seasonal period from FFT (used when seasonal_order not specified)
         n = len(yval)
         trend_coeffs = np.polyfit(np.arange(n), yval, 1)
         detrended = yval - np.polyval(trend_coeffs, np.arange(n))
@@ -1609,23 +1650,35 @@ def _analysis_sarima(df, horizon_s: float) -> dict:
         s = int(round(1.0 / dom_freq)) if dom_freq > 0 else 12
         s = max(2, min(s, max(2, n // 4)))
 
-        best_aic = float("inf")
-        best_mdl = None
-        best_order = ((1, 1, 1), (1, 0, 1, s))
-        for pdq in [(1, 1, 1), (1, 0, 1), (0, 1, 1)]:
-            for PDQ in [(1, 0, 1, s), (0, 1, 1, s)]:
-                try:
-                    m = _SARIMAX(yval, order=pdq, seasonal_order=PDQ,
-                                 enforce_stationarity=False,
-                                 enforce_invertibility=False).fit(disp=False)
-                    if m.aic < best_aic:
-                        best_aic   = m.aic
-                        best_mdl   = m
-                        best_order = (pdq, PDQ)
-                except Exception:
-                    pass
-        if best_mdl is None:
-            return {"error": f"No se pudo ajustar SARIMA con periodo s={s}."}
+        if order is not None and seasonal_order is not None:
+            # Use specified orders directly
+            best_mdl = _SARIMAX(yval, order=order, seasonal_order=seasonal_order,
+                                enforce_stationarity=False,
+                                enforce_invertibility=False).fit(disp=False)
+            best_aic = best_mdl.aic
+            best_order = (order, seasonal_order)
+            info_suffix = "(ordenes especificados)"
+            if best_mdl is None:
+                return {"error": "No se pudo ajustar SARIMA con los ordenes especificados."}
+        else:
+            best_aic = float("inf")
+            best_mdl = None
+            best_order = ((1, 1, 1), (1, 0, 1, s))
+            info_suffix = f"(mejor variante, periodo s={s})"
+            for pdq in [(1, 1, 1), (1, 0, 1), (0, 1, 1)]:
+                for PDQ in [(1, 0, 1, s), (0, 1, 1, s)]:
+                    try:
+                        m = _SARIMAX(yval, order=pdq, seasonal_order=PDQ,
+                                     enforce_stationarity=False,
+                                     enforce_invertibility=False).fit(disp=False)
+                        if m.aic < best_aic:
+                            best_aic   = m.aic
+                            best_mdl   = m
+                            best_order = (pdq, PDQ)
+                    except Exception:
+                        pass
+            if best_mdl is None:
+                return {"error": f"No se pudo ajustar SARIMA con periodo s={s}."}
 
         n_pts = max(30, min(120, int(horizon_s / max(step_s, 1))))
         fc    = best_mdl.forecast(steps=n_pts)
@@ -1636,7 +1689,7 @@ def _analysis_sarima(df, horizon_s: float) -> dict:
             fc, future_ts, yval, t_last, residuals,
             f"SARIMA{best_order[0]}x{best_order[1]}", "#10b981"
         )
-        info = f"SARIMA{best_order[0]}x{best_order[1]} — periodo s={s} — AIC={best_aic:.2f}"
+        info = f"SARIMA{best_order[0]}x{best_order[1]} — AIC={best_aic:.2f} {info_suffix}"
         return {"overlays": overlays, "sub_charts": [], "explanation": info}
     except Exception as e:
         return {"error": f"SARIMA fallido: {e}"}
@@ -1709,68 +1762,526 @@ def _analysis_compare(df) -> dict:
     split = max(int(n * 0.8), n - 30)
     y_train, y_test = yval[:split], yval[split:]
     s_train, s_test = secs[:split], secs[split:]
-    if len(y_test) < 3:
-        return {"error": "No hay suficientes datos de prueba (necesita ≥ 15 puntos total)."}
+    n_test = len(y_test)
+    if n_test < 3:
+        return {"error": "No hay suficientes datos de prueba (necesita >= 15 puntos total)."}
 
     results = []
 
-    def _rmse(a, b):
-        return float(np.sqrt(np.mean((a - b) ** 2)))
+    def _rmse(a, b): return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b)) ** 2)))
+    def _mae(a, b):  return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
+    def _add(name, pred):
+        try:
+            p = np.asarray(pred, dtype=float)
+            if len(p) == n_test and np.isfinite(p).all():
+                results.append({"Modelo": name, "RMSE": _rmse(y_test, p), "MAE": _mae(y_test, p)})
+        except Exception:
+            pass
 
-    def _mae(a, b):
-        return float(np.mean(np.abs(a - b)))
+    # ── Estimacion periodo (FFT) para features ciclicos ──────────────────
+    trend_c = np.polyfit(np.arange(n), yval, 1)
+    detrended = yval - np.polyval(trend_c, np.arange(n))
+    fft_freqs = np.fft.rfftfreq(n)
+    fft_mags  = np.abs(np.fft.rfft(detrended))
+    dom_freq  = fft_freqs[int(np.argmax(fft_mags[1:])) + 1] if len(fft_mags) > 1 else 0
+    period_s  = int(round(1.0 / dom_freq)) if dom_freq > 0 else max(10, n // 4)
+    period_s  = max(2, min(period_s, max(2, len(y_train) // 2)))
 
-    n_test = len(y_test)
+    # Features ML: [t, t^2, t^3, sin(2pi*t/T), cos(2pi*t/T)]
+    def _ml_features(s_arr, period):
+        t = s_arr - s_arr[0]
+        sin_f = np.sin(2 * np.pi * t / max(period, 1))
+        cos_f = np.cos(2 * np.pi * t / max(period, 1))
+        return np.column_stack([t, t**2, t**3, sin_f, cos_f])
 
-    # 1. Linear
+    Xtr = _ml_features(s_train, period_s * step_s)
+    Xte = _ml_features(np.concatenate([s_train, s_test]), period_s * step_s)[len(s_train):]
+
+    # ── Grupo A: BASELINE / ESTADISTICA (numpy) ──────────────────────────
+
+    # 1. Naive (ultimo valor conocido)
+    _add("Naive", np.full(n_test, y_train[-1]))
+
+    # 2. Media global
+    _add("Mean", np.full(n_test, float(np.mean(y_train))))
+
+    # 3. Mediana global
+    _add("Median", np.full(n_test, float(np.median(y_train))))
+
+    # 4. Random Walk con drift
+    drift = (y_train[-1] - y_train[0]) / max(len(y_train) - 1, 1)
+    _add("RW+Drift", np.array([y_train[-1] + drift * (i + 1) for i in range(n_test)]))
+
+    # 5. SMA k=5
+    k5 = min(5, len(y_train))
+    _add("SMA(5)", np.full(n_test, float(np.mean(y_train[-k5:]))))
+
+    # 6. SMA k=10
+    k10 = min(10, len(y_train))
+    _add("SMA(10)", np.full(n_test, float(np.mean(y_train[-k10:]))))
+
+    # 7. SMA k=20
+    k20 = min(20, len(y_train))
+    _add("SMA(20)", np.full(n_test, float(np.mean(y_train[-k20:]))))
+
+    # 8. WMA (pesos lineales, ultimos k puntos)
+    kw = min(10, len(y_train))
+    weights = np.arange(1, kw + 1, dtype=float)
+    weights /= weights.sum()
+    _add("WMA(10)", np.full(n_test, float(np.dot(weights, y_train[-kw:]))))
+
+    # 9. EWM / SES alpha=0.1
+    try:
+        s = float(pd.Series(y_train).ewm(alpha=0.1, adjust=False).mean().iloc[-1])
+        _add("EWM(a=0.1)", np.full(n_test, s))
+    except Exception:
+        pass
+
+    # 10. EWM / SES alpha=0.3
+    try:
+        s = float(pd.Series(y_train).ewm(alpha=0.3, adjust=False).mean().iloc[-1])
+        _add("EWM(a=0.3)", np.full(n_test, s))
+    except Exception:
+        pass
+
+    # 11. EWM / SES alpha=0.6
+    try:
+        s = float(pd.Series(y_train).ewm(alpha=0.6, adjust=False).mean().iloc[-1])
+        _add("EWM(a=0.6)", np.full(n_test, s))
+    except Exception:
+        pass
+
+    # 12. EWM / SES alpha=0.9
+    try:
+        s = float(pd.Series(y_train).ewm(alpha=0.9, adjust=False).mean().iloc[-1])
+        _add("EWM(a=0.9)", np.full(n_test, s))
+    except Exception:
+        pass
+
+    # 13. Linear regression
     try:
         c = np.polyfit(s_train, y_train, 1)
-        pred = np.polyval(c, s_test)
-        results.append({"Modelo": "Linear", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+        _add("Linear", np.polyval(c, s_test))
     except Exception:
         pass
 
-    # 2. Polynomial (degree=2)
+    # 14. Polynomial deg=2
     try:
         c = np.polyfit(s_train, y_train, 2)
-        pred = np.polyval(c, s_test)
-        results.append({"Modelo": "Polynomial(2)", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+        _add("Poly(2)", np.polyval(c, s_test))
     except Exception:
         pass
 
-    # 3. Holt
+    # 15. Polynomial deg=3
     try:
-        _, level, trend_holt = _holt_smooth(y_train, 0.3, 0.1)
+        c = np.polyfit(s_train, y_train, 3)
+        p = np.polyval(c, s_test)
+        _add("Poly(3)", p)
+    except Exception:
+        pass
+
+    # 16. Polynomial deg=4
+    try:
+        c = np.polyfit(s_train, y_train, 4)
+        _add("Poly(4)", np.polyval(c, s_test))
+    except Exception:
+        pass
+
+    # 17. Holt (alpha=0.3, beta=0.1)
+    try:
+        _, level, trend_h = _holt_smooth(y_train, 0.3, 0.1)
         avg_int = float(np.mean(np.diff(s_train))) if len(s_train) > 1 else step_s
-        trend_ps = trend_holt / max(avg_int, 1.0)
-        pred = np.array([level + trend_ps * (step_s * (i + 1)) for i in range(n_test)])
-        results.append({"Modelo": "Holt", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+        tp = trend_h / max(avg_int, 1.0)
+        _add("Holt(0.3,0.1)", np.array([level + tp * (step_s * (i + 1)) for i in range(n_test)]))
     except Exception:
         pass
 
-    # 4. AR (numpy)
+    # 18. Holt (alpha=0.5, beta=0.2)
     try:
-        p = min(5, len(y_train) // 5)
-        X = np.stack([y_train[i: len(y_train) - p + i] for i in range(p)], axis=1)
-        y_reg = y_train[p:]
-        coeffs_ar, _, _, _ = np.linalg.lstsq(X, y_reg, rcond=None)
-        buf = list(y_train[-p:])
-        pred_ar = []
-        for _ in range(n_test):
-            yh = float(np.dot(buf, coeffs_ar))
-            pred_ar.append(yh)
-            buf = buf[1:] + [yh]
-        pred = np.array(pred_ar)
-        results.append({"Modelo": f"AR({p})", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+        _, level, trend_h = _holt_smooth(y_train, 0.5, 0.2)
+        avg_int = float(np.mean(np.diff(s_train))) if len(s_train) > 1 else step_s
+        tp = trend_h / max(avg_int, 1.0)
+        _add("Holt(0.5,0.2)", np.array([level + tp * (step_s * (i + 1)) for i in range(n_test)]))
     except Exception:
         pass
 
-    # 5. ARIMA (statsmodels)
+    # 19. Holt (alpha=0.7, beta=0.3)
+    try:
+        _, level, trend_h = _holt_smooth(y_train, 0.7, 0.3)
+        avg_int = float(np.mean(np.diff(s_train))) if len(s_train) > 1 else step_s
+        tp = trend_h / max(avg_int, 1.0)
+        _add("Holt(0.7,0.3)", np.array([level + tp * (step_s * (i + 1)) for i in range(n_test)]))
+    except Exception:
+        pass
+
+    # 20. AR(1) numpy
+    try:
+        X1 = y_train[:-1].reshape(-1, 1)
+        y1 = y_train[1:]
+        c1, _, _, _ = np.linalg.lstsq(X1, y1, rcond=None)
+        buf = [y_train[-1]]
+        pred_ar1 = []
+        for _ in range(n_test):
+            yh = float(c1[0] * buf[-1])
+            pred_ar1.append(yh)
+            buf.append(yh)
+        _add("AR(1)", pred_ar1)
+    except Exception:
+        pass
+
+    # 21. AR(2) numpy
+    try:
+        if len(y_train) > 4:
+            X2 = np.stack([y_train[:-2], y_train[1:-1]], axis=1)
+            y2 = y_train[2:]
+            c2, _, _, _ = np.linalg.lstsq(X2, y2, rcond=None)
+            buf2 = list(y_train[-2:])
+            pred_ar2 = []
+            for _ in range(n_test):
+                yh = float(np.dot(c2, buf2))
+                pred_ar2.append(yh)
+                buf2 = buf2[1:] + [yh]
+            _add("AR(2)", pred_ar2)
+    except Exception:
+        pass
+
+    # 22. AR(p) auto (numpy)
+    try:
+        p_auto = min(max(2, len(y_train) // 10), 10)
+        X_auto = np.stack([y_train[i: len(y_train) - p_auto + i] for i in range(p_auto)], axis=1)
+        y_reg  = y_train[p_auto:]
+        c_auto, _, _, _ = np.linalg.lstsq(X_auto, y_reg, rcond=None)
+        buf_a = list(y_train[-p_auto:])
+        pred_auto = []
+        for _ in range(n_test):
+            yh = float(np.dot(buf_a, c_auto))
+            pred_auto.append(yh)
+            buf_a = buf_a[1:] + [yh]
+        _add(f"AR({p_auto})", pred_auto)
+    except Exception:
+        pass
+
+    # 23. Fourier extrapolation (2 armonicos)
+    try:
+        n_tr = len(y_train)
+        t_tr = np.arange(n_tr)
+        n_harm = 2
+        cols_f = [np.ones(n_tr)]
+        for h in range(1, n_harm + 1):
+            cols_f += [np.sin(2 * np.pi * h * t_tr / period_s),
+                       np.cos(2 * np.pi * h * t_tr / period_s)]
+        A = np.column_stack(cols_f)
+        cf, _, _, _ = np.linalg.lstsq(A, y_train, rcond=None)
+        t_te = np.arange(n_tr, n_tr + n_test)
+        cols_p = [np.ones(n_test)]
+        for h in range(1, n_harm + 1):
+            cols_p += [np.sin(2 * np.pi * h * t_te / period_s),
+                       np.cos(2 * np.pi * h * t_te / period_s)]
+        _add("Fourier(2)", np.column_stack(cols_p) @ cf)
+    except Exception:
+        pass
+
+    # 24. Fourier extrapolation (4 armonicos)
+    try:
+        n_tr = len(y_train)
+        t_tr = np.arange(n_tr)
+        n_harm = 4
+        cols_f = [np.ones(n_tr)]
+        for h in range(1, n_harm + 1):
+            cols_f += [np.sin(2 * np.pi * h * t_tr / period_s),
+                       np.cos(2 * np.pi * h * t_tr / period_s)]
+        A = np.column_stack(cols_f)
+        cf, _, _, _ = np.linalg.lstsq(A, y_train, rcond=None)
+        t_te = np.arange(n_tr, n_tr + n_test)
+        cols_p = [np.ones(n_test)]
+        for h in range(1, n_harm + 1):
+            cols_p += [np.sin(2 * np.pi * h * t_te / period_s),
+                       np.cos(2 * np.pi * h * t_te / period_s)]
+        _add("Fourier(4)", np.column_stack(cols_p) @ cf)
+    except Exception:
+        pass
+
+    # 25. Cubic Spline extrapolation (scipy)
+    if _HAS_SCIPY:
+        try:
+            cs = _CubicSpline(s_train, y_train, extrapolate=True)
+            _add("CubicSpline", cs(s_test))
+        except Exception:
+            pass
+
+    # ── Grupo B: STATSMODELS ──────────────────────────────────────────────
     if _HAS_STATSMODELS:
+        # 26. ARIMA(1,0,0) = AR puro
+        try:
+            m = _ARIMA(y_train, order=(1, 0, 0)).fit()
+            _add("ARIMA(1,0,0)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 27. ARIMA(0,0,1) = MA puro
+        try:
+            m = _ARIMA(y_train, order=(0, 0, 1)).fit()
+            _add("ARIMA(0,0,1)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 28. ARIMA(1,0,1) = ARMA
+        try:
+            m = _ARIMA(y_train, order=(1, 0, 1)).fit()
+            _add("ARIMA(1,0,1)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 29. ARIMA(0,1,1) = IMA / SES con diferenciacion
+        try:
+            m = _ARIMA(y_train, order=(0, 1, 1)).fit()
+            _add("ARIMA(0,1,1)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 30. ARIMA(1,1,0)
+        try:
+            m = _ARIMA(y_train, order=(1, 1, 0)).fit()
+            _add("ARIMA(1,1,0)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 31. ARIMA(1,1,1)
         try:
             m = _ARIMA(y_train, order=(1, 1, 1)).fit()
-            pred = m.forecast(steps=n_test)
-            results.append({"Modelo": "ARIMA(1,1,1)", "RMSE": _rmse(y_test, pred), "MAE": _mae(y_test, pred)})
+            _add("ARIMA(1,1,1)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 32. ARIMA(2,1,1)
+        try:
+            m = _ARIMA(y_train, order=(2, 1, 1)).fit()
+            _add("ARIMA(2,1,1)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 33. ARIMA(1,1,2)
+        try:
+            m = _ARIMA(y_train, order=(1, 1, 2)).fit()
+            _add("ARIMA(1,1,2)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 34. ARIMA(2,1,2)
+        try:
+            m = _ARIMA(y_train, order=(2, 1, 2)).fit()
+            _add("ARIMA(2,1,2)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 35. ARIMA(0,1,2)
+        try:
+            m = _ARIMA(y_train, order=(0, 1, 2)).fit()
+            _add("ARIMA(0,1,2)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 36. ARIMA(2,0,2)
+        try:
+            m = _ARIMA(y_train, order=(2, 0, 2)).fit()
+            _add("ARIMA(2,0,2)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 37. ARIMA(1,2,1)
+        try:
+            m = _ARIMA(y_train, order=(1, 2, 1)).fit()
+            _add("ARIMA(1,2,1)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 38. ARIMA(3,1,0)
+        try:
+            m = _ARIMA(y_train, order=(3, 1, 0)).fit()
+            _add("ARIMA(3,1,0)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 39. ARIMA(0,1,3)
+        try:
+            m = _ARIMA(y_train, order=(0, 1, 3)).fit()
+            _add("ARIMA(0,1,3)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 40. Holt-Winters Aditivo
+        try:
+            s_hw = max(2, min(period_s, len(y_train) // 2))
+            m = _HoltWinters(y_train, trend="add", seasonal="add",
+                             seasonal_periods=s_hw,
+                             initialization_method="estimated").fit(optimized=True, disp=False)
+            _add("HW-Aditivo", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 41. Holt-Winters Multiplicativo
+        try:
+            s_hw = max(2, min(period_s, len(y_train) // 2))
+            if np.all(y_train > 0):
+                m = _HoltWinters(y_train, trend="add", seasonal="mul",
+                                 seasonal_periods=s_hw,
+                                 initialization_method="estimated").fit(optimized=True, disp=False)
+                _add("HW-Multiplicativo", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 42. Holt-Winters sin estacionalidad (solo tendencia)
+        try:
+            m = _HoltWinters(y_train, trend="add", seasonal=None,
+                             initialization_method="estimated").fit(optimized=True, disp=False)
+            _add("HW-Tendencia", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 43. ETS (solo nivel, sin tendencia ni estacionalidad)
+        try:
+            m = _HoltWinters(y_train, trend=None, seasonal=None,
+                             initialization_method="estimated").fit(optimized=True, disp=False)
+            _add("ETS(N,N,N)", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 44. SARIMA auto (periodo detectado por FFT)
+        try:
+            s_sar = max(2, min(period_s, len(y_train) // 3))
+            m = _SARIMAX(y_train, order=(1, 1, 1), seasonal_order=(1, 0, 1, s_sar),
+                         enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+            _add(f"SARIMA(1,1,1)x(1,0,1,{s_sar})", m.forecast(n_test))
+        except Exception:
+            pass
+
+        # 45. AutoReg (statsmodels)
+        try:
+            p_ar = min(max(2, len(y_train) // 10), 12)
+            m = _AutoReg(y_train, lags=p_ar, old_names=False).fit()
+            _add(f"AutoReg({p_ar})", m.forecast(steps=n_test))
+        except Exception:
+            pass
+
+    # ── Grupo C: SKLEARN ─────────────────────────────────────────────────
+    if _HAS_SKLEARN:
+        # 46. Ridge
+        try:
+            m = _Ridge(alpha=1.0)
+            m.fit(Xtr, y_train)
+            _add("Ridge", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 47. Lasso
+        try:
+            m = _Lasso(alpha=0.01, max_iter=5000)
+            m.fit(Xtr, y_train)
+            _add("Lasso", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 48. ElasticNet
+        try:
+            m = _ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000)
+            m.fit(Xtr, y_train)
+            _add("ElasticNet", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 49. Bayesian Ridge
+        try:
+            m = _BayesianRidge()
+            m.fit(Xtr, y_train)
+            _add("BayesianRidge", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 50. Huber (robusto a outliers)
+        try:
+            m = _HuberRegressor(max_iter=300)
+            m.fit(Xtr, y_train)
+            _add("Huber", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 51. TheilSen (muy robusto)
+        try:
+            m = _TheilSen(max_iter=200, random_state=42)
+            m.fit(Xtr, y_train)
+            _add("TheilSen", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 52. SVR lineal
+        try:
+            m = _SVR(kernel="linear", C=1.0, max_iter=2000)
+            m.fit(Xtr, y_train)
+            _add("SVR-Linear", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 53. SVR RBF
+        try:
+            m = _SVR(kernel="rbf", C=10.0, epsilon=0.1, max_iter=2000)
+            m.fit(Xtr, y_train)
+            _add("SVR-RBF", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 54. Random Forest
+        try:
+            m = _RF(n_estimators=100, max_depth=5, random_state=42, n_jobs=1)
+            m.fit(Xtr, y_train)
+            _add("RandomForest", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 55. Gradient Boosting
+        try:
+            m = _GBR(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42)
+            m.fit(Xtr, y_train)
+            _add("GradientBoosting", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 56. Extra Trees
+        try:
+            m = _ET(n_estimators=100, max_depth=5, random_state=42, n_jobs=1)
+            m.fit(Xtr, y_train)
+            _add("ExtraTrees", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 57. KNN k=3
+        try:
+            m = _KNN(n_neighbors=min(3, len(y_train)))
+            m.fit(Xtr, y_train)
+            _add("KNN(k=3)", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 58. KNN k=5
+        try:
+            m = _KNN(n_neighbors=min(5, len(y_train)))
+            m.fit(Xtr, y_train)
+            _add("KNN(k=5)", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 59. KNN k=10
+        try:
+            m = _KNN(n_neighbors=min(10, len(y_train)))
+            m.fit(Xtr, y_train)
+            _add("KNN(k=10)", m.predict(Xte))
+        except Exception:
+            pass
+
+        # 60. Polynomial(2) + Ridge (pipeline)
+        try:
+            pipe = _make_pipeline(_PolyFeatures(degree=2, include_bias=False), _Ridge(alpha=1.0))
+            pipe.fit(Xtr, y_train)
+            _add("PolyRidge(2)", pipe.predict(Xte))
         except Exception:
             pass
 
@@ -1783,46 +2294,64 @@ def _analysis_compare(df) -> dict:
     df_res.index  = range(1, len(df_res) + 1)
     best = df_res.iloc[0]["Modelo"]
 
-    # Build bar chart for RMSE
-    bar_data = df_res.copy()
-    bar_data["rank"] = ["🥇 " + bar_data.iloc[0]["Modelo"]] + [
-        str(r) for r in bar_data.iloc[1:]["Modelo"]
-    ]
-    chart = (
-        alt.Chart(bar_data)
+    # Grupos para colorear la barra
+    def _group(name):
+        if any(x in name for x in ("Naive","Mean","Median","RW","SMA","WMA","EWM")): return "Baseline"
+        if any(x in name for x in ("Linear","Poly","Holt","Fourier","CubicSpline","AR(")): return "Clasico"
+        if any(x in name for x in ("ARIMA","SARIMA","HW","ETS","AutoReg","MA(")): return "Estadistico"
+        return "ML"
+
+    df_res["Grupo"] = df_res["Modelo"].apply(_group)
+
+    group_colors = {
+        "Baseline":    "#6b7280",
+        "Clasico":     "#6366f1",
+        "Estadistico": "#f59e0b",
+        "ML":          "#10b981",
+    }
+    color_scale = alt.Scale(
+        domain=list(group_colors.keys()),
+        range=list(group_colors.values()),
+    )
+
+    # Top 20 para la barra (legibility)
+    top20 = df_res.head(20).copy()
+    top20["label"] = top20["Modelo"].apply(lambda m: ("🥇 " if m == best else "") + m)
+
+    bar = (
+        alt.Chart(top20)
         .mark_bar()
         .encode(
-            y=alt.Y("Modelo:N", sort="-x", title="Modelo"),
+            y=alt.Y("Modelo:N", sort=top20["Modelo"].tolist(), title="Modelo"),
             x=alt.X("RMSE:Q", title="RMSE (menor = mejor)"),
-            color=alt.condition(
-                alt.datum.Modelo == best,
-                alt.value("#10b981"), alt.value("#6b7280"),
-            ),
-            tooltip=["Modelo:N",
+            color=alt.Color("Grupo:N", scale=color_scale, legend=alt.Legend(title="Grupo")),
+            tooltip=["Modelo:N", "Grupo:N",
                      alt.Tooltip("RMSE:Q", format=".4f"),
                      alt.Tooltip("MAE:Q", format=".4f")],
         )
-        .properties(title=f"Comparacion de modelos — {n_test} puntos de prueba", height=220)
+        .properties(
+            title=f"Top 20 modelos — {n_test} puntos de prueba (total comparados: {len(df_res)})",
+            height=max(280, 22 * len(top20)),
+        )
     )
+
+    groups_present = df_res["Grupo"].unique().tolist()
     explanation = (
         f"**Mejor modelo: {best}** (RMSE={df_res.iloc[0]['RMSE']:.4f}, "
         f"MAE={df_res.iloc[0]['MAE']:.4f}). "
-        f"Comparados {len(df_res)} modelos en {n_test} puntos de prueba (ultimo 20% de los datos)."
+        f"Comparados **{len(df_res)} modelos** en {n_test} puntos de prueba. "
+        f"Grupos: {', '.join(groups_present)}."
     )
     return {
         "overlays": [],
         "sub_charts": [
-            {"title": "🏆 Comparacion de Modelos (RMSE/MAE)",
-             "type": "altair", "chart": chart},
-            {"title": "📋 Tabla de Resultados",
+            {"title": "🏆 Top 20 Modelos — RMSE (menor es mejor)",
+             "type": "altair", "chart": bar},
+            {"title": f"📋 Tabla completa ({len(df_res)} modelos)",
              "type": "table", "df": df_res},
         ],
         "explanation": explanation,
     }
-
-
-# ---- Analisis Residual ----
-def _analysis_residuals(df) -> dict:
     ts = _prep_ts_data(df)
     if ts is None:
         return {"error": "Se necesitan datos numericos con timestamps para analisis residual."}
@@ -1932,11 +2461,36 @@ def _detect_analysis_command(prompt: str) -> str | None:
 
 def _dispatch_analysis_command(prompt: str, df, context) -> dict:
     """Ejecuta el analisis correspondiente al comando detectado."""
+    import re as _re
+
+    horizon_s = _parse_horizon_seconds(prompt) or 86400
+    p_stripped = prompt.strip()
+
+    # --- Parameterized forms (check before generic detect) ---
+    # @ar(p)
+    m = _re.match(r'@ar\s*\(\s*(\d+)\s*\)', p_stripped, _re.I)
+    if m:
+        return _analysis_ar(df, horizon_s, p=int(m.group(1)))
+
+    # @arima(p,d,q)
+    m = _re.match(r'@arima\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', p_stripped, _re.I)
+    if m:
+        return _analysis_arima(df, horizon_s, order=(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+
+    # @sarima(p,d,q)(P,D,Q,s)
+    m = _re.match(
+        r'@sarima\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\s*'
+        r'\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)',
+        p_stripped, _re.I
+    )
+    if m:
+        pdq = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        PDQs = (int(m.group(4)), int(m.group(5)), int(m.group(6)), int(m.group(7)))
+        return _analysis_sarima(df, horizon_s, order=pdq, seasonal_order=PDQs)
+
     cmd = _detect_analysis_command(prompt)
     if cmd is None:
         return {}
-
-    horizon_s = _parse_horizon_seconds(prompt) or 86400
 
     if cmd == "@acf":
         nlags = 40

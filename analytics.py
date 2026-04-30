@@ -85,6 +85,8 @@ def correlation_matrix(tag_data: dict[str, pd.DataFrame]) -> pd.DataFrame | None
             continue
         sub = sub.sort_values("TimeStamp")
         sub = sub.set_index("TimeStamp")["Value_Num"]
+        # Eliminar timestamps duplicados (promedio) antes de indexar
+        sub = sub.groupby(level=0).mean()
         numeric_series[tag_name] = sub
 
     if len(numeric_series) < 2:

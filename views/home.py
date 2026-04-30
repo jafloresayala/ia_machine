@@ -60,15 +60,12 @@ def render():
         ("📡", "Live Monitor",
          "Monitoreo en tiempo real con KPIs, alertas y health scores.",
          "monitor"),
-        ("🔬", "Analytics Lab",
+        ("🎮", "Playground",
          "Outliers, correlaciones, distribuciones y detección de anomalías.",
          "analytics"),
         ("⚖️", "Compare",
          "Comparación side-by-side entre máquinas, líneas o períodos.",
          "compare"),
-        ("💡", "AI Insights",
-         "Insights automáticos sobre salud, riesgos y oportunidades.",
-         "insights"),
     ]
     for i, (icon, title, desc, target) in enumerate(capabilities):
         with cap_cols[i % 3]:
@@ -82,35 +79,6 @@ def render():
                 """, unsafe_allow_html=True)
                 if st.button("Abrir →", key=f"home_go_{target}", use_container_width=True):
                     goto(target)
-
-    # ------- Quick start ---------
-    st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
-    st.markdown("##### Quick start")
-    qs_cols = st.columns(2)
-    with qs_cols[0]:
-        with st.container(border=True):
-            st.markdown("**💬 Pregúntale al agente**")
-            st.caption("Describe qué quieres saber en lenguaje natural.")
-            samples = [
-                "Muéstrame la temperatura del Reflow de la Línea 1 de hoy",
-                "¿Hay outliers en el SPI de la Paste Printer L7L?",
-                "Compara el estado de todas las Paste Printers",
-            ]
-            for q in samples:
-                if st.button(q, key=f"qs_{hash(q)}", use_container_width=True):
-                    st.session_state["_prefill_query"] = q
-                    goto("agent")
-    with qs_cols[1]:
-        with st.container(border=True):
-            st.markdown("**🔎 Explora máquinas**")
-            st.caption("Navega el catálogo completo y abre cualquier equipo.")
-            if df is not None and not df.empty:
-                sample = df.sample(min(5, len(df)))[["line_name", "machine_name"]]
-                for _, row in sample.iterrows():
-                    label = f"📍 {row['machine_name']}  ·  {row['line_name']}"
-                    if st.button(label, key=f"qm_{row['machine_name']}_{row['line_name']}", use_container_width=True):
-                        st.session_state["selected_machine_name"] = row["machine_name"]
-                        goto("monitor")
 
     st.markdown(f"""
     <div class="app-footer">
