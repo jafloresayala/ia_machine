@@ -1,32 +1,53 @@
-﻿"""Agent — terminal inmersivo. Input nativo de Streamlit estilizado como terminal."""
-from datetime import datetime, timedelta
-import html as _html_module
-
+﻿"""Agent — abre el agente externo en una nueva pestaña."""
 import streamlit as st
+from theme import page_header
 
-from config import OLLAMA_MODEL
-from machine_registry import get_machine_names, smart_find_machine, get_machine_tags
-from api_client import fetch_tag_values
-from analytics import numeric_summary, categorical_summary
-from dashboard_builder import infer_tag_mode
-from llm_engine import terminal_chat_stream
+AGENT_URL = "http://10.132.12.178:7860/"
 
-# ─────────────────────────────────────────────────────────
-# Estados
-# ─────────────────────────────────────────────────────────
-STATE_IDLE      = "idle"
-STATE_FETCHING  = "fetching"
-STATE_THINKING  = "thinking"
-STATE_STREAMING = "streaming"
-STATE_ERROR     = "error"
 
-_STATE_META = {
-    STATE_IDLE:      {"dot": "#3fb950", "label": "idle",      "anim": False},
-    STATE_FETCHING:  {"dot": "#f0883e", "label": "fetching PI data", "anim": True},
-    STATE_THINKING:  {"dot": "#58a6ff", "label": "thinking",  "anim": True},
-    STATE_STREAMING: {"dot": "#58a6ff", "label": "streaming", "anim": True},
-    STATE_ERROR:     {"dot": "#f85149", "label": "error",     "anim": False},
-}
+def render():
+    page_header(
+        eyebrow="AI · Agent",
+        title="Agent Kim",
+        subtitle="Agente conversacional de inteligencia artificial para tu piso de planta.",
+    )
+
+    st.markdown(
+        f"""
+        <div style='
+            display:flex;flex-direction:column;align-items:center;
+            justify-content:center;padding:80px 20px;
+            background:#f8fafc;border:2px dashed #cbd5e1;
+            border-radius:16px;margin-top:10px;
+        '>
+            <div style='font-size:4rem;margin-bottom:16px;'>🤖</div>
+            <div style='font-size:1.2rem;font-weight:700;color:#0f172a;margin-bottom:8px;'>
+                Agent Kim
+            </div>
+            <div style='font-size:0.88rem;color:#64748b;text-align:center;
+                        max-width:340px;margin-bottom:28px;'>
+                El agente se ejecuta en un servicio externo.
+                Haz clic en el botón para abrirlo en una nueva pestaña.
+            </div>
+            <a href="{AGENT_URL}" target="_blank" rel="noopener noreferrer"
+               style='
+                   display:inline-flex;align-items:center;gap:10px;
+                   background:linear-gradient(135deg,#4f46e5,#7c3aed);
+                   color:#fff;font-weight:700;font-size:1rem;
+                   padding:14px 32px;border-radius:12px;
+                   text-decoration:none;
+                   box-shadow:0 4px 14px rgba(79,70,229,.35);
+               '>
+                🚀&nbsp; Abrir Agent Kim
+            </a>
+            <div style='margin-top:16px;font-size:0.75rem;color:#94a3b8;'>
+                {AGENT_URL}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 _BASE_SYSTEM = """Eres el agente MIP (Machine Intelligence Platform) de Kimball Electronics Mexico.
 Experto en manufactura SMT: Paste Printer, SPI, Pick & Place, Reflow, AOI, ICT.
